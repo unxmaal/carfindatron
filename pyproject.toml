@@ -1,0 +1,18 @@
+[project]
+name = "carfindatron"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = ["playwright>=1.50"]
+
+[project.scripts]
+carfindatron = "carfindatron.cli:main"
+
+[dependency-groups]
+dev = ["pytest"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["carfindatron"]
