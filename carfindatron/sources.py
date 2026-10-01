@@ -31,6 +31,20 @@ def http_get(url):
             time.sleep(5 * (attempt + 1))
 
 
+def iso_date(value):
+    """Sources send ISO dates and, since 2026-09-23, some US-format ones. Returns YYYY-MM-DD or None."""
+    s = str(value or "").strip()
+    if not s:
+        return None
+    m = re.match(r"(\d{4})-(\d{2})-(\d{2})", s)
+    if m:
+        return "-".join(m.groups())
+    m = re.match(r"(\d{1,2})/(\d{1,2})/(\d{4})$", s)
+    if m:
+        return f"{m[3]}-{int(m[1]):02d}-{int(m[2]):02d}"
+    return None
+
+
 def is_platinum(vin):
     return vin.upper().startswith(PLATINUM_VIN_PREFIX)
 
@@ -111,7 +125,7 @@ def listing(source, vin, year, trim, price, miles, distance, dealer, city, state
     return dict(source=source, model=profile.key, vin=vin, year=int(year), trim=norm_trim(trim, vin, profile), price=int(price),
                 miles=int(miles or 0), distance=int(distance), dealer=dealer, city=city, state=state,
                 url=url, one_owner=bool(one_owner), accident=bool(accident), condition=condition,
-                listed_since=str(listed_since)[:10] if listed_since else None,
+                listed_since=iso_date(listed_since),
                 msrp=int(msrp) if msrp else None, note=note or None,
                 doc_fee=int(doc_fee) if doc_fee is not None else None, value=int(value) if value else None,
                 followers=int(followers) if followers is not None else None,
@@ -287,46 +301,81 @@ def toyota(zip_code, profile=CROWN, get=http_get, dealers=None):
     return out
 
 
-def tcom_inventory(zip_code, timeout_s=90):
-    """New-car inventory from toyota.com. Its GraphQL call only fires in a headed browser, so an
-    off-screen Chrome window loads the search page and the page's own query is widened to nationwide."""
+def tcom_page(body, page_no, radius, size=250):
+    """toyota.com moved its query arguments into GraphQL variables (2026-09); older inline arguments still work."""
+    body = json.loads(json.dumps(body))
+    if isinstance(body.get("variables"), dict):
+        body["variables"].update(distance=radius, pageNo=page_no, pageSize=size, interiorMedia=False)
+        return body
+    q = re.sub(r"distance: \d+", f"distance: {radius}", body["query"])
+    q = re.sub(r"pageNo: \d+", f"pageNo: {page_no}", q)
+    q = re.sub(r"pageSize: \d+", f"pageSize: {size}", q)
+    body["query"] = q.replace("interiorMedia: true", "interiorMedia: false")
+    return body
+
+
+def tcom_vehicles(response_json):
+    data = (response_json.get("data") or {}).get("locateVehiclesByZip") or {}
+    return data.get("vehicleSummary") or []
+
+
+def tcom_inventory(zip_code, timeout_s=90, radius=5000, size=250, max_pages=12, on_page=None):
+    """New-car inventory from toyota.com. The GraphQL call only fires in a headed browser and cannot be
+    replayed (a replay comes back empty), so every request the page makes is rewritten in flight. The page
+    stops asking once it has rendered enough cars, so the search is reloaded once per page of results and the
+    run ends at the first short page."""
     from playwright.sync_api import sync_playwright
 
-    pages, done = [], []
-
-    def handler(route):
-        body = route.request.post_data or ""
-        if "locateVehiclesByZip" not in body or done:
-            return route.continue_()
-        q = json.loads(body)
-        base = re.sub(r"distance: \d+", "distance: 5000", q["query"]).replace("interiorMedia: true", "interiorMedia: false")
-        page_no, resp = 1, None
-        while True:
-            q["query"] = re.sub(r"pageNo: \d+", f"pageNo: {page_no}", base)
-            resp = route.fetch(post_data=json.dumps(q))
-            data = resp.json()["data"]["locateVehiclesByZip"]
-            pages.append(data)
-            if page_no >= (data["pagination"]["totalPages"] or 1):
-                break
-            page_no += 1
-        done.append(True)
-        route.fulfill(response=resp)
+    cars, page_no, last_count = {}, 1, size
 
     with sync_playwright() as p:
         browser = p.chromium.launch(channel="chrome", headless=False, args=[
             "--disable-blink-features=AutomationControlled", "--window-position=-2400,-2400", "--window-size=900,700"])
         try:
             pg = browser.new_page()
-            pg.route("**/graphql", handler)
-            pg.goto(TCOM_SEARCH.format(zip=zip_code), wait_until="domcontentloaded", timeout=timeout_s * 1000)
-            deadline = time.time() + timeout_s
-            while not done and time.time() < deadline:
-                pg.wait_for_timeout(250)
+            want = {"page": 1}
+            seen = {"count": None}
+
+            def on_route(route):
+                body = route.request.post_data or ""
+                if "locateVehiclesByZip" not in body:
+                    return route.continue_()
+                return route.continue_(post_data=json.dumps(tcom_page(json.loads(body), want["page"], radius, size)))
+
+            def on_response(response):
+                if "graphql" not in response.url or "locateVehiclesByZip" not in (response.request.post_data or ""):
+                    return
+                try:
+                    batch = tcom_vehicles(json.loads(response.text()))
+                except Exception:
+                    return
+                if batch:
+                    cars.update({v["vin"]: v for v in batch})
+                    seen["count"] = len(batch)
+
+            pg.route("**/graphql", on_route)
+            pg.on("response", on_response)
+            while page_no <= max_pages and last_count >= size:
+                want["page"] = page_no
+                for attempt in range(3):
+                    seen["count"] = None
+                    pg.goto(TCOM_SEARCH.format(zip=zip_code), wait_until="domcontentloaded", timeout=timeout_s * 1000)
+                    deadline = time.time() + 25
+                    while seen["count"] is None and time.time() < deadline:
+                        pg.wait_for_timeout(500)
+                    if seen["count"] is not None:
+                        break
+                if seen["count"] is None:
+                    break
+                last_count = seen["count"]
+                if on_page:
+                    on_page(page_no, last_count)
+                page_no += 1
         finally:
             browser.close()
-    if not done:
-        raise TimeoutError("toyota.com never issued its inventory query")
-    return [v for d in pages for v in d["vehicleSummary"]]
+    if not cars:
+        raise RuntimeError("toyota.com returned no inventory")
+    return list(cars.values())
 
 
 def parse_tcom(vehicles, zip_code, profile, dealers):
