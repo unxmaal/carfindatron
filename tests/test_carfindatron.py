@@ -375,7 +375,6 @@ def test_delivery_is_free_nearby_then_shipping_plus_inspection():
     assert far["delivery"] == 1016 and near["delivery"] == 0
 
 
-
 def test_market_per_mile_reads_the_cpo_mileage_slope():
     cars = [dict(c, condition="cpo") for c in synthetic(ms_discount=0)]
     assert abs(analysis.market_per_mile(cars) - 0.15) < 0.02
@@ -622,7 +621,6 @@ def test_merge_keeps_the_most_concerning_prior_use(con):
     assert c["prior_use"] == "Rental"
 
 
-
 def test_es_profile_keeps_only_the_300h_and_decodes_trim_from_the_vin():
     cf = sources.carfax(ZIP, ES300H, get=fake_get)
     assert cf and all(l["vin"][4:7] == "A1C" and l["model"] == "es300h" for l in cf)
@@ -724,3 +722,48 @@ def test_home_zip_is_not_in_any_tracked_file():
                            capture_output=True, text=True, check=True).stdout.split()
     leaks = [f for f in files if (root / f).is_file() and home in (root / f).read_text(errors="ignore")]
     assert leaks == []
+
+
+@pytest.mark.parametrize("raw,want", [
+    ("2026-09-04", "2026-09-04"), ("2026-09-04T05:32:57.332Z", "2026-09-04"), ("09/08/2026", "2026-09-08"),
+    ("9/8/2026", "2026-09-08"), ("", None), (None, None), ("not a date", None),
+])
+def test_iso_date_accepts_both_formats_sources_send(raw, want):
+    assert sources.iso_date(raw) == want
+
+
+def test_listing_normalizes_a_us_format_date():
+    l = sources.listing("toyota", "V", 2025, "", 1, 1, 1, "", "", "", "", listed_since="09/08/2026")
+    assert l["listed_since"] == "2026-09-08"
+
+
+def test_build_survives_a_us_format_date_already_in_the_database(tmp_path):
+    con = store.connect(tmp_path / "c.db")
+    row = dict(sources.listing("toyota", "JTDAFAAF0T3000001", 2026, "", 50000, 10, 5, "D", "C", "GA", ""),
+               trim="Platinum", listed_since="09/08/2026")
+    run = store.record_run(con, ZIP, [row], [], ts="2026-09-30T00:00:00+00:00")
+    [c] = cli.build(con, run)["cars"]
+    assert c["listed_since"] == "2026-09-08" and c["days"] == 22
+
+
+TCOM_VARIABLES = {"operationName": "getVehicles", "query": "query getVehicles($distance: Int) { locateVehiclesByZip }",
+                  "variables": {"zipCode": "10001", "distance": 20, "pageNo": 1, "pageSize": 250, "interiorMedia": True}}
+TCOM_INLINE = {"query": "query { locateVehiclesByZip(zipCode: \"10001\", pageNo: 1, pageSize: 250, distance: 20, interiorMedia: true) }"}
+
+
+def test_tcom_page_sets_distance_and_page_in_either_query_shape():
+    v = sources.tcom_page(TCOM_VARIABLES, 3, 5000)
+    assert v["variables"] == {"zipCode": "10001", "distance": 5000, "pageNo": 3, "pageSize": 250, "interiorMedia": False}
+    assert TCOM_VARIABLES["variables"]["distance"] == 20
+    q = sources.tcom_page(TCOM_INLINE, 3, 5000)["query"]
+    assert "distance: 5000" in q and "pageNo: 3" in q and "interiorMedia: false" in q
+
+
+
+
+
+
+def test_tcom_vehicles_reads_a_batch_and_tolerates_an_empty_answer():
+    assert sources.tcom_vehicles({"data": {"locateVehiclesByZip": {"vehicleSummary": [{"vin": "a"}]}}}) == [{"vin": "a"}]
+    assert sources.tcom_vehicles({"data": {"locateVehiclesByZip": None}}) == []
+    assert sources.tcom_vehicles({"data": {}}) == [] and sources.tcom_vehicles({}) == []

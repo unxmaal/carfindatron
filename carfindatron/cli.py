@@ -64,7 +64,9 @@ def build(con, run_id, profile=CROWN, per_mile=None, delivery=analysis.Delivery(
         c["days_from_scan"] = not c.get("listed_since") and bool(c["history"])
         if c["days_from_scan"]:
             c["listed_since"] = c["history"][0][0][:10]
-        c["days"] = (today - date.fromisoformat(c["listed_since"])).days if c.get("listed_since") else None
+        since = sources.iso_date(c.get("listed_since"))
+        c["listed_since"] = since
+        c["days"] = (today - date.fromisoformat(since)).days if since else None
     analysis.leverage(cars, model and model["sigma"])
     analysis.fee_flags(cars)
     analysis.targets(cars, analysis.new_discount(cars, profile.focus))
