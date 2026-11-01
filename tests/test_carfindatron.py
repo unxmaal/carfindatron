@@ -5,6 +5,7 @@ import random
 import re
 from statistics import median
 import sqlite3
+import urllib.error
 import urllib.parse
 from pathlib import Path
 
@@ -161,13 +162,88 @@ def test_status_new_drop_gone_back_across_runs(con):
     assert c3["b"]["status"] == "BACK" and c3["a"]["status"] == ""
 
 
-def test_partial_run_is_not_a_baseline(con):
+def test_partial_run_is_still_a_baseline_for_the_sources_it_covered(con):
+    """A failing source must not cost the run its history: the subset rule in status() is what guards against
+    a baseline that is missing a source, not the ok flag."""
     store.record_run(con, "z", listings(("a", 50000), ("b", 48000)), [], ts="2026-01-01")
-    store.record_run(con, "z", listings(("a", 50000)), [["toyota", "boom"]], ts="2026-01-02")
-    r3 = store.record_run(con, "z", listings(("a", 50000), ("b", 48000)), [], ts="2026-01-03")
-    c3 = store.merged(con, r3)
-    assert store.status(con, r3, c3) == [] and all(c["status"] == "" for c in c3)
-    assert [p for _, p in store.price_history(con)["b"]] == [48000, 48000]
+    r2 = store.record_run(con, "z", listings(("a", 50000), ("b", 48000)), [["crown:toyota", "boom"]], ts="2026-01-02")
+    assert con.execute("SELECT ok FROM runs WHERE id=?", (r2,)).fetchone()[0] == 1
+    r3 = store.record_run(con, "z", listings(("a", 50000), ("b", 47000)), [], ts="2026-01-03")
+    c3 = {c["vin"]: c for c in store.merged(con, r3)}
+    assert store.status(con, r3, list(c3.values())) == []
+    assert c3["b"]["status"] == "DROP -1,000" and c3["a"]["status"] == ""
+    assert [p for _, p in store.price_history(con)["b"]] == [48000, 48000, 47000]
+
+
+def test_change_detection_does_not_depend_on_the_ok_flag(con):
+    """The report must label changes off the shared-source rule alone. Gating status() on ok meant one failing
+    source left every car with no status, so the digest reported neither new cars nor price drops."""
+    store.record_run(con, "z", listings(("a", 50000)), [], ts="2026-01-01")
+    r2 = store.record_run(con, "z", listings(("a", 49000)), [], ts="2026-01-02")
+    con.execute("UPDATE runs SET ok=0 WHERE id=?", (r2,))
+    [c] = cli.build(con, r2, per_mile=0.25)["cars"]
+    assert c["status"] == "DROP -1,000"
+
+
+def test_connect_restores_the_ok_flag_on_runs_that_stored_listings(tmp_path):
+    db = tmp_path / "c.db"
+    con = store.connect(db)
+    run = store.record_run(con, "z", listings(("a", 50000)), [["crown:carfax", "boom"]], ts="2026-01-01")
+    empty = store.record_run(con, "z", [], [["crown:carfax", "boom"]], ts="2026-01-02")
+    con.execute("UPDATE runs SET ok=0")  # how every row written under the old rule looks
+    con.commit()
+    con.close()
+    con = store.connect(db)
+    assert con.execute("SELECT ok FROM runs WHERE id=?", (run,)).fetchone()[0] == 1
+    assert con.execute("SELECT ok FROM runs WHERE id=?", (empty,)).fetchone()[0] == 0
+
+
+def test_a_run_that_stored_nothing_is_not_a_baseline(con):
+    store.record_run(con, "z", listings(("a", 50000)), [], ts="2026-01-01")
+    empty = store.record_run(con, "z", [], [["crown:carfax", "boom"]], ts="2026-01-02")
+    assert con.execute("SELECT ok FROM runs WHERE id=?", (empty,)).fetchone()[0] == 0
+
+
+def test_source_failures_counts_only_a_current_unbroken_streak(con):
+    store.record_run(con, "z", listings(("a", 50000)), [["crown:carfax", "boom"]], ts="2026-01-01")
+    store.record_run(con, "z", listings(("a", 50000)), [], ts="2026-01-02")
+    store.record_run(con, "z", listings(("a", 50000)), [["crown:carfax", "boom"]], ts="2026-01-03")
+    r4 = store.record_run(con, "z", listings(("a", 50000)),
+                          [["crown:carfax", "boom"], ["crown:toyota", "boom"]], ts="2026-01-04")
+    assert store.source_failures(con, r4) == {"crown:carfax": 2, "crown:toyota": 1}
+    clean = store.record_run(con, "z", listings(("a", 50000)), [], ts="2026-01-05")
+    assert store.source_failures(con, clean) == {}
+
+
+def test_http_get_gives_up_on_4xx_but_retries_a_throttle(monkeypatch):
+    tries = []
+
+    def fail(code):
+        def opener(req, timeout=None):
+            tries.append(code)
+            raise urllib.error.HTTPError(req.full_url, code, "no", {}, None)
+        return opener
+
+    monkeypatch.setattr(sources.time, "sleep", lambda s: None)
+    monkeypatch.setattr(sources.urllib.request, "urlopen", fail(403))
+    with pytest.raises(urllib.error.HTTPError):
+        sources.http_get("https://example.test/x")
+    assert len(tries) == 1, "a 403 means the same thing four times over"
+    tries.clear()
+    monkeypatch.setattr(sources.urllib.request, "urlopen", fail(429))
+    with pytest.raises(urllib.error.HTTPError):
+        sources.http_get("https://example.test/x")
+    assert len(tries) == 4
+
+
+def test_digest_escalates_a_source_that_keeps_failing(con):
+    for day in range(1, 4):
+        run = store.record_run(con, "z", listings(("a", 50000)), [["crown:carfax", "HTTPError: 403"]],
+                               ts=f"2026-01-0{day}")
+    payload = cli.build(con, run, per_mile=0.25)
+    assert payload["run"]["failures"] == {"crown:carfax": 3}
+    assert "failed: crown:carfax (3 runs running)" in cli.digest(payload)
+    assert "(3 runs running)" in cli.text(payload)
 
 
 def test_rank_orders_by_weighted_cost_and_marks_pareto():
@@ -239,7 +315,7 @@ def test_cli_partial_failure_is_recorded_and_warned(tmp_path, monkeypatch, capsy
     db = tmp_path / "c.db"
     assert cli.main(["--db", str(db), "--html", str(tmp_path / "r.html"), "--profiles", "crown"]) == 0
     assert "WARNING: crown:toyota failed: OSError: blocked" in capsys.readouterr().out
-    assert sqlite3.connect(db).execute("SELECT ok FROM runs").fetchone()[0] == 0
+    assert sqlite3.connect(db).execute("SELECT ok FROM runs").fetchone()[0] == 1
 
 
 def test_pareto_only_compares_within_a_trim():
@@ -407,6 +483,16 @@ def test_fees_come_from_listing_then_dealer_then_median():
     assert (a["fee"], a["fee_source"]) == (150, "listing")
     assert (b["fee"], b["fee_source"]) == (150, "dealer")
     assert (c["fee"], c["fee_source"]) == (500, "median")
+
+
+def test_no_fee_anywhere_falls_back_to_a_typical_fee_not_zero():
+    """$0 is the one figure certainly wrong, and it silently drops the fee out of effective cost."""
+    cars = [car("a", 50000), car("b", 51000)]
+    analysis.impute_fees(cars)
+    assert all(c["fee"] == analysis.TYPICAL_DOC_FEE and c["fee_source"] == "typical" for c in cars)
+    assert analysis.TYPICAL_DOC_FEE > 0
+    priced = analysis.rank([car("c", 50000)], per_mile=0, typical_fee=600)
+    assert priced[0]["cost"] == 50600
 
 
 def test_fee_is_part_of_effective_cost():

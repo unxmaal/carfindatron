@@ -3,6 +3,7 @@
 import json
 import re
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -19,12 +20,20 @@ UNKNOWN_DISTANCE = 9999
 SWEPT = "*"  # dealer-cache marker: the whole locator was paged, so a missing code is not in it; one per brand
 
 
+RETRY_STATUS = {408, 429, 500, 502, 503, 504}
+
+
 def http_get(url):
     req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
     for attempt in range(4):
         try:
             with urllib.request.urlopen(req, timeout=30) as r:
                 return json.loads(r.read(), strict=False)
+        except urllib.error.HTTPError as e:
+            # A 403 or 404 means the same thing four times over; only a timeout, a throttle or a 5xx is worth a retry.
+            if e.code not in RETRY_STATUS or attempt == 3:
+                raise
+            time.sleep(5 * (attempt + 1))
         except Exception:
             if attempt == 3:
                 raise
