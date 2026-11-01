@@ -2,6 +2,7 @@
 
 import json
 import re
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -21,6 +22,47 @@ SWEPT = "*"  # dealer-cache marker: the whole locator was paged, so a missing co
 
 
 RETRY_STATUS = {408, 429, 500, 502, 503, 504}
+CARFAX_HOME = "https://www.carfax.com/"
+# Carfax answers its own API from a browser context but 403s a plain client. Fetching from the loaded page
+# means the session's cookies and client hints apply without this code ever handling them.
+PAGE_FETCH = """async url => {
+  const r = await fetch(url, {credentials: 'include', headers: {Accept: 'application/json'}});
+  return {status: r.status, body: await r.text()};
+}"""
+
+
+class Blocked(Exception):
+    """A source refused the request as automated traffic. `listings` carries whatever was fetched first, so a
+    block on a later page costs only that page."""
+
+    def __init__(self, message, listings=None):
+        super().__init__(message)
+        self.listings = listings or []
+
+
+def page_get(page, url, on_challenge=None, attempts=3, pace_s=0.5):
+    """Fetch JSON from inside a loaded page. A 403 is handed to on_challenge, which is expected to put the
+    window in front of the operator; with no handler it fails at once rather than looping unattended.
+    Requests are paced because a site that blocks on request signature will escalate to an IP ban."""
+    for attempt in range(attempts):
+        if pace_s:
+            time.sleep(pace_s)
+        res = page.evaluate(PAGE_FETCH, url)
+        status, body = res["status"], res["body"]
+        if status == 200:
+            return json.loads(body, strict=False)
+        # The message is stored in the run and rendered into the report, so it names the endpoint, never the query.
+        where = urllib.parse.urlsplit(url).netloc
+        if status == 403:
+            if on_challenge is None or attempt == attempts - 1:
+                raise Blocked(f"{where} returned 403; the browser session is not trusted")
+            on_challenge(attempt)
+            continue
+        if status in RETRY_STATUS and attempt < attempts - 1:
+            time.sleep(5 * (attempt + 1))
+            continue
+        raise Blocked(f"{where} returned {status}")
+    raise Blocked(f"{where} never answered in {attempts} attempts")
 
 
 def http_get(url):
@@ -192,7 +234,7 @@ def tcom_addons(v):
 
 def carfax(zip_code, profile=CROWN, get=http_get, dealers=None, new=False):
     year_min, year_max = profile.years
-    raw, page, pages = {}, 1, 1
+    raw, page, pages, blocked = {}, 1, 1, None
     if new:
         year_max += 1
     while page <= pages:
@@ -202,7 +244,13 @@ def carfax(zip_code, profile=CROWN, get=http_get, dealers=None, new=False):
             "rows": 25, "page": page}
         if not new:
             params["certified"] = "true"
-        data = get(f"{CARFAX_API}?{urllib.parse.urlencode(params)}")
+        try:
+            data = get(f"{CARFAX_API}?{urllib.parse.urlencode(params)}")
+        except Blocked as e:
+            if not raw:
+                raise
+            blocked = e
+            break
         raw.update((l["vin"], l) for l in data["listings"])
         pages = data.get("totalPageCount") or 1
         page += 1
@@ -222,6 +270,8 @@ def carfax(zip_code, profile=CROWN, get=http_get, dealers=None, new=False):
             ext=exterior(None, l.get("exteriorColor")), int_color=interior(None, l.get("interiorColor")),
             use=prior_use(h.get("useType") for h in (l.get("vehicleUseHistory") or {}).get("history") or []), profile=profile,
             dealer_url=d.get("dealerInventoryUrl")))
+    if blocked:
+        raise Blocked(f"{blocked} on page {page} of {pages}, kept {len(out)} listings", listings=out)
     return out
 
 
@@ -415,3 +465,47 @@ def toyota_new(zip_code, profile=CROWN, get=http_get, dealers=None, fetch=tcom_i
 
 
 SOURCES = {"carfax": carfax, "toyota": toyota, "carfax_new": carfax_new, "toyota_new": toyota_new}
+BROWSER_SOURCES = {"carfax", "carfax_new"}
+
+
+def challenge_prompt(page):
+    """Put the window in front of the operator and wait. Returns None when nothing is attached to ask, so an
+    unattended run fails instead of hanging forever on a challenge nobody will clear."""
+    if not sys.stdin.isatty():
+        return None
+    page.bring_to_front()
+    print("carfax: a challenge is showing in the Chrome window. Clear it, then press Enter.", file=sys.stderr)
+    input()
+    return page
+
+
+class CarfaxSession:
+    """One Chrome session shared by every Carfax fetch in a run, with its own on-disk profile. The cookie the
+    site grants on first load lives in that profile, so later runs start already trusted and nothing here ever
+    handles the token. The window sits off screen until a challenge needs a human."""
+
+    def __init__(self, profile_dir, pace_s=0.5, timeout_s=90):
+        self.profile_dir, self.pace_s, self.timeout_s = profile_dir, pace_s, timeout_s
+        self.ctx = self.page = self._pw = None
+
+    def __enter__(self):
+        from playwright.sync_api import sync_playwright
+        self._pw = sync_playwright().start()
+        self.profile_dir.parent.mkdir(parents=True, exist_ok=True)
+        self.ctx = self._pw.chromium.launch_persistent_context(
+            str(self.profile_dir), channel="chrome", headless=False, args=[
+                "--disable-blink-features=AutomationControlled", "--window-position=-2400,-2400",
+                "--window-size=900,700"])
+        self.page = self.ctx.pages[0] if self.ctx.pages else self.ctx.new_page()
+        self.page.goto(CARFAX_HOME, wait_until="domcontentloaded", timeout=self.timeout_s * 1000)
+        return self
+
+    def get(self, url):
+        handler = (lambda _attempt: challenge_prompt(self.page)) if sys.stdin.isatty() else None
+        return page_get(self.page, url, on_challenge=handler, pace_s=self.pace_s)
+
+    def __exit__(self, *exc):
+        if self.ctx:
+            self.ctx.close()
+        if self._pw:
+            self._pw.stop()

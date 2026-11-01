@@ -1,6 +1,7 @@
 """Scan Carfax, Toyota/Lexus Certified and toyota.com for each vehicle profile, store every listing, and report."""
 
 import argparse
+import contextlib
 import json
 import os
 import sys
@@ -13,6 +14,9 @@ from .profiles import CROWN, PROFILES
 
 HOME = Path.home() / ".local/share/carfindatron"
 CONFIG = Path.home() / ".config/carfindatron/config.json"
+CARFAX_PROFILE = HOME / "chrome-carfax"
+# Carfax needs a browser session, so it is not in the scheduled run; fetch it on demand with --augment.
+DAILY_SOURCES = tuple(n for n in sources.SOURCES if n not in sources.BROWSER_SOURCES)
 
 
 def configured_zip(env=None, config=None):
@@ -27,18 +31,33 @@ def configured_zip(env=None, config=None):
         return None
 
 
-def scan(con, zip_code, profiles, names):
-    listings, errors = [], []
+def carfax_session():
+    """The browser Carfax needs. A seam: tests replace it so no suite ever launches Chrome."""
+    return sources.CarfaxSession(CARFAX_PROFILE)
+
+
+def scan(con, zip_code, profiles, names, get_for=None, into=None):
+    """Fetch the named sources for each profile. With `into`, the rows join that existing run and the sources
+    that succeeded stop counting as failures, so an on-demand source supplements a run instead of replacing it."""
+    listings, errors, resolved = [], [], []
     dealers = store.load_dealers(con, zip_code)
     for prof in profiles:
         for name in prof.sources:
             if name not in names:
                 continue
+            label = f"{prof.key}:{name}"
             try:
-                listings += sources.SOURCES[name](zip_code, prof, dealers=dealers)
+                get = get_for(name) if get_for else None
+                listings += sources.SOURCES[name](zip_code, prof, dealers=dealers, **({"get": get} if get else {}))
+                resolved.append(label)
             except Exception as e:
-                errors.append([f"{prof.key}:{name}", f"{type(e).__name__}: {e}"])
+                # A source blocked partway through still hands back the pages it got, but it has not recovered,
+                # so it keeps its error and its failure streak.
+                listings += getattr(e, "listings", None) or []
+                errors.append([label, f"{type(e).__name__}: {e}"])
     store.save_dealers(con, zip_code, dealers)
+    if into is not None:
+        return store.augment_run(con, into, listings, resolved, errors), errors
     if not listings:
         return None, errors
     return store.record_run(con, zip_code, listings, errors), errors
@@ -151,8 +170,11 @@ def main(argv=None):
     p.add_argument("--inspection", type=float, default=d.inspection, help="$ pre-purchase inspection for a remote buy")
     p.add_argument("--typical-fee", type=int, default=analysis.TYPICAL_DOC_FEE,
                    help="$ doc fee assumed when no listing in the scan carries one at all")
-    p.add_argument("--sources", default=",".join(sources.SOURCES),
-                   help="toyota_new drives an off-screen Chrome window; drop it to stay browser-free")
+    p.add_argument("--sources", default=",".join(DAILY_SOURCES),
+                   help=f"default {','.join(DAILY_SOURCES)}; {','.join(sorted(sources.BROWSER_SOURCES))} need a "
+                        "browser session, so pass them with --augment. toyota_new drives an off-screen Chrome window")
+    p.add_argument("--augment", action="store_true",
+                   help="add the fetched sources to the last run instead of starting a new one")
     p.add_argument("--db", type=Path, default=HOME / "carfindatron.db")
     p.add_argument("--html", type=Path, default=HOME / "report.html",
                    help="landing page; each vehicle also gets report-<profile>.html beside it")
@@ -171,14 +193,20 @@ def main(argv=None):
 
     a.db.parent.mkdir(parents=True, exist_ok=True)
     con = store.connect(a.db)
-    if a.report_only:
+    names = a.sources.split(",")
+    into = None
+    if a.report_only or a.augment:
         last = con.execute("SELECT MAX(id) FROM runs").fetchone()[0]
         if last is None:
             print("no runs stored yet", file=sys.stderr)
             return 1
         run_id = last
-    else:
-        run_id, errors = scan(con, a.zip, profiles, a.sources.split(","))
+        into = last if a.augment else None
+    if not a.report_only:
+        wants_browser = bool(set(names) & sources.BROWSER_SOURCES)
+        with (carfax_session() if wants_browser else contextlib.nullcontext()) as session:
+            get_for = (lambda n: session.get if n in sources.BROWSER_SOURCES else None) if session else None
+            run_id, errors = scan(con, a.zip, profiles, names, get_for=get_for, into=into)
         if run_id is None:
             print("every source failed: " + "; ".join(": ".join(e) for e in errors), file=sys.stderr)
             return 1
