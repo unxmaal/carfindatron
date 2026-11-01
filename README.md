@@ -101,7 +101,7 @@ uv run carfindatron --free-radius 150 --ship-base 400 --ship-per-mile 0.70 --ins
 ./scripts/schedule.sh remove
 ```
 
-Scheduled runs post a macOS notification when a car in the focus trims appears or drops in price, or when a source fails. A Mac asleep at the scheduled time runs the scan when it wakes. Output goes to `~/.local/share/carfindatron/daily.log`.
+Scheduled runs post a macOS notification when a car in the focus trims appears or drops in price, or when a source fails. A source that keeps failing says how long it has been down ("17 runs running") in the notification, the terminal summary and the report's banner, so an outage does not read the same on day 17 as on day 1. A Mac asleep at the scheduled time runs the scan when it wakes. Output goes to `~/.local/share/carfindatron/daily.log`.
 
 ## Options
 
@@ -114,6 +114,7 @@ Scheduled runs post a macOS notification when a car in the focus trims appears o
 | `--ship-base`, `--ship-per-mile`, `--ship-min` | 350, 0.60, 500 | Shipping estimate beyond the radius |
 | `--inspection` | 200 | Pre-purchase inspection for a remote purchase |
 | `--per-mile` | market rate | Charge per odometer mile |
+| `--typical-fee` | 448 | Doc fee assumed when no listing in the scan carries one |
 | `--db`, `--html` | `~/.local/share/carfindatron/` | Database and landing page locations |
 | `--report-only` | off | Rebuild pages from the last scan |
 | `--open` | off | Open the report when done |

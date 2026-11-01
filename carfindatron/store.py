@@ -51,7 +51,8 @@ def connect(path):
     if "url" not in {r["name"] for r in con.execute("PRAGMA table_info(dealers)")}:
         con.execute("ALTER TABLE dealers ADD COLUMN url TEXT")
         con.execute("DELETE FROM dealers")
-        con.commit()
+    con.execute("UPDATE runs SET ok=1 WHERE ok=0 AND EXISTS (SELECT 1 FROM listings WHERE run_id=runs.id)")
+    con.commit()
     return con
 
 
@@ -59,7 +60,7 @@ def record_run(con, zip_code, listings, errors, ts=None):
     ts = ts or datetime.now(timezone.utc).isoformat(timespec="seconds")
     with con:
         run_id = con.execute("INSERT INTO runs(ts, zip, ok, errors) VALUES (?,?,?,?)",
-                             (ts, zip_code, int(not errors), json.dumps(errors))).lastrowid
+                             (ts, zip_code, int(bool(listings)), json.dumps(errors))).lastrowid
         con.executemany(
             f"INSERT OR REPLACE INTO listings(run_id, {', '.join(COLS)}) "
             f"VALUES (?, {', '.join('?' * len(COLS))})",
@@ -122,6 +123,22 @@ def price_history(con):
                             WHERE r.ok=1 GROUP BY l.run_id, l.vin ORDER BY r.id"""):
         hist.setdefault(r["vin"], []).append([r["ts"], r["p"]])
     return hist
+
+
+def source_failures(con, run_id, limit=60):
+    """profile:source -> how many consecutive runs ending at run_id it has failed in. Only sources that failed
+    in run_id appear, so a one-off reads 1 and a source down for a fortnight reads 14."""
+    sets = [{e[0] for e in json.loads(r["errors"] or "[]")}
+            for r in con.execute("SELECT errors FROM runs WHERE id<=? ORDER BY id DESC LIMIT ?", (run_id, limit))]
+    out = {}
+    for name in (sets[0] if sets else ()):
+        n = 0
+        for s in sets:
+            if name not in s:
+                break
+            n += 1
+        out[name] = n
+    return out
 
 
 def run_sources(con, run_id, model="crown"):

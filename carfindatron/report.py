@@ -121,7 +121,8 @@ $("trend-h").textContent=`${FL} asking price over time`;if(!PR.has_new){$("leg-n
 if(PR.miles){$("f-mmin").value=PR.miles[0];$("f-mmax").value=PR.miles[1]}
 const P=D.cars.filter(inFocus),cnt=(a,k)=>a.filter(c=>c.condition===k).length;
 $("sub").textContent=`Scan ${new Date(D.run.ts).toLocaleString()} from ZIP ${D.zip} · ${D.cars.length} listed (all trims) · ${FL}: ${cnt(P,"cpo")} certified pre-owned${PR.has_new?`, ${cnt(P,"new")} new`:""} · sources: ${PR.has_new?"Carfax, Toyota Certified, toyota.com":"Carfax, Lexus Certified (via Toyota's certified inventory)"}`;
-if(D.run.errors.length){const w=$("warn");w.className="warn";w.textContent="Partial scan: "+D.run.errors.map(e=>e.join(": ")).join("; ")}
+if(D.run.errors.length){const f=D.run.failures||{},w=$("warn");w.className="warn";
+ w.textContent="Partial scan: "+D.run.errors.map(e=>e.join(": ")+(f[e[0]]?` (${f[e[0]]} runs running)`:"")).join("; ")}
 $("pm").textContent=D.weights.per_mile;$("pms").textContent=D.weights.per_mile_source==="market"?" (what the market charges per mile on certified cars of this model in this scan)":"";$("fr").textContent=fmt(D.weights.free_radius);$("zp").textContent=D.zip;
 $("sb").textContent=fmt(D.weights.ship_base);$("spm").textContent=D.weights.ship_per_mile.toFixed(2);$("smin").textContent=fmt(D.weights.ship_min);$("insp").textContent=fmt(D.weights.inspection);
 
@@ -247,7 +248,7 @@ function draw(){
   tr.appendChild(td(c.condition==="new"&&!c.miles?"new":fmt(c.miles),"n"));
   tr.appendChild(td(stack(c.distance>=9999?"?":`${fmt(c.distance)} mi`,[c.delivery?`${usd(c.delivery)} to home`:"drive"]),"n"));
   const fe=td(usd(c.fee)+(c.fee_source==="listing"?"":"*"),"n");if(c.fee_source!=="listing")fe.classList.add("muted");
-  const feeTip=[c.fee_source==="listing"?`Fees ${usd(c.fee)}`:c.fee_source==="dealer"?`Fees ${usd(c.fee)}: this dealer's, from another listing`:`Fees ${usd(c.fee)}: unknown, median used`,
+  const feeTip=[c.fee_source==="listing"?`Fees ${usd(c.fee)}`:c.fee_source==="dealer"?`Fees ${usd(c.fee)}: this dealer's, from another listing`:c.fee_source==="typical"?`Fees ${usd(c.fee)}: no listing in this scan carried a fee, typical doc fee assumed`:`Fees ${usd(c.fee)}: unknown, median used`,
    ...(c.fee_items||[]).map(([n,a,cat])=>`${n}${a?` ${usd(a)}`:""} (${cat})`),...(c.fee_flags||[])];
   if((c.fee_flags||[]).length)fe.prepend(tag(`${c.fee_flags.length} to fight`,"bad"));
   fe.addEventListener("pointermove",e=>showTip(e,feeTip));fe.addEventListener("pointerleave",hideTip);tr.appendChild(fe);

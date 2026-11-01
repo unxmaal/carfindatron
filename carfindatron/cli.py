@@ -44,17 +44,18 @@ def scan(con, zip_code, profiles, names):
     return store.record_run(con, zip_code, listings, errors), errors
 
 
-def build(con, run_id, profile=CROWN, per_mile=None, delivery=analysis.Delivery()):
+def build(con, run_id, profile=CROWN, per_mile=None, delivery=analysis.Delivery(),
+          typical_fee=analysis.TYPICAL_DOC_FEE):
     run = dict(con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone())
     cars = store.merged(con, run_id, profile.key)
-    gone = store.status(con, run_id, cars, profile.key) if run["ok"] else []
+    gone = store.status(con, run_id, cars, profile.key)
     per_mile_source = "flag" if per_mile is not None else "market"
     if per_mile is None:
         per_mile = analysis.market_per_mile(cars)
     model = analysis.fit(cars)
     states = {k: analysis.by_state([c for c in cars if not k or c["condition"] == k]) if model else []
               for k in ("", "cpo", "new")}
-    analysis.rank(cars, per_mile, delivery)
+    analysis.rank(cars, per_mile, delivery, typical_fee)
     hist = store.price_history(con)
     cuts = store.source_cuts(con, run_id)
     today = date.fromisoformat(run["ts"][:10])
@@ -72,7 +73,9 @@ def build(con, run_id, profile=CROWN, per_mile=None, delivery=analysis.Delivery(
     analysis.targets(cars, analysis.new_discount(cars, profile.focus))
     home = next((c["state"] for c in sorted(cars, key=lambda c: c["distance"])), "")
     errors = [e for e in json.loads(run["errors"]) if ":" not in e[0] or e[0].startswith(profile.key + ":")]
-    return {"zip": run["zip"], "run": {"ts": run["ts"], "errors": errors},
+    runs_failed = store.source_failures(con, run_id)
+    failures = {e[0]: runs_failed[e[0]] for e in errors if runs_failed.get(e[0], 0) > 1}
+    return {"zip": run["zip"], "run": {"ts": run["ts"], "errors": errors, "failures": failures},
             "profile": {"key": profile.key, "title": profile.title, "focus": list(profile.focus),
                         "has_new": any(s.endswith("_new") for s in profile.sources), "miles": profile.miles,
                         "nav": [{"key": p.key, "title": p.title, "href": f"report-{p.key}.html"} for p in PROFILES.values()]},
@@ -102,7 +105,9 @@ def text(payload, top=25):
     n_new = sum(c["condition"] == "new" for c in plat)
     lines.append(f"\n{' / '.join(payload['profile']['focus'])}: {len(plat) - n_new} CPO, {n_new} new. "
                  f"{len(payload['cars'])} stored this run.")
-    lines += [f"WARNING: {n} failed: {e}" for n, e in payload["run"]["errors"]]
+    fails = payload["run"].get("failures") or {}
+    lines += [f"WARNING: {n} failed: {e}" + (f" ({fails[n]} runs running)" if n in fails else "")
+              for n, e in payload["run"]["errors"]]
     return "\n".join(lines)
 
 
@@ -119,7 +124,9 @@ def digest(payload):
     if drops:
         parts.append(f"{len(drops)} price drop{'s' if len(drops) > 1 else ''}")
     if payload["run"]["errors"]:
-        parts.append("failed: " + ", ".join(n for n, _ in payload["run"]["errors"]))
+        fails = payload["run"].get("failures") or {}
+        parts.append("failed: " + ", ".join(
+            f"{n} ({fails[n]} runs running)" if n in fails else n for n, _ in payload["run"]["errors"]))
     return f"{payload['profile']['title']}: " + "; ".join(parts) if parts else None
 
 
@@ -142,6 +149,8 @@ def main(argv=None):
     p.add_argument("--ship-per-mile", type=float, default=d.ship_per_mile, help="$ per mile of shipping distance")
     p.add_argument("--ship-min", type=float, default=d.ship_min, help="$ minimum shipping charge")
     p.add_argument("--inspection", type=float, default=d.inspection, help="$ pre-purchase inspection for a remote buy")
+    p.add_argument("--typical-fee", type=int, default=analysis.TYPICAL_DOC_FEE,
+                   help="$ doc fee assumed when no listing in the scan carries one at all")
     p.add_argument("--sources", default=",".join(sources.SOURCES),
                    help="toyota_new drives an off-screen Chrome window; drop it to stay browser-free")
     p.add_argument("--db", type=Path, default=HOME / "carfindatron.db")
@@ -177,7 +186,7 @@ def main(argv=None):
     a.html.parent.mkdir(parents=True, exist_ok=True)
     messages = []
     for i, prof in enumerate(profiles):
-        payload = build(con, run_id, prof, a.per_mile, delivery)
+        payload = build(con, run_id, prof, a.per_mile, delivery, a.typical_fee)
         page = report.render(payload)
         (a.html.parent / f"report-{prof.key}.html").write_text(page)
         if i == 0:

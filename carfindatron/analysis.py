@@ -6,6 +6,7 @@ from statistics import median
 
 MIN_MOVE = 250
 MIN_FIT = 12
+TYPICAL_DOC_FEE = 448  # used only when no listing in the scan carries a fee at all; $0 would be the one certainly wrong figure
 
 
 @dataclass(frozen=True)
@@ -29,26 +30,27 @@ def dealer_key(c):
     return (c.get("dealer") or "").lower().replace("toyota", "").replace(" of ", " ").strip(" ·,")
 
 
-def impute_fees(cars):
-    """Doc fee per car: its own listing's, else the same dealer's on another listing, else the median."""
+def impute_fees(cars, typical_fee=TYPICAL_DOC_FEE):
+    """Doc fee per car: its own listing's, else the same dealer's on another listing, else the median of the
+    fees this scan did see, else typical_fee. The last case means no source supplied a fee at all."""
     by_dealer = {}
     for c in cars:
         if c.get("doc_fee") is not None:
             by_dealer.setdefault(dealer_key(c), c["doc_fee"])
     known = [c["doc_fee"] for c in cars if c.get("doc_fee") is not None]
-    typical = round(median(known)) if known else 0
+    typical = round(median(known)) if known else typical_fee
     for c in cars:
         if c.get("doc_fee") is not None:
             c["fee"], c["fee_source"] = c["doc_fee"], "listing"
         elif dealer_key(c) in by_dealer:
             c["fee"], c["fee_source"] = by_dealer[dealer_key(c)], "dealer"
         else:
-            c["fee"], c["fee_source"] = typical, "median"
+            c["fee"], c["fee_source"] = typical, "median" if known else "typical"
 
 
-def rank(cars, per_mile, delivery=Delivery()):
+def rank(cars, per_mile, delivery=Delivery(), typical_fee=TYPICAL_DOC_FEE):
     if any("fee" not in c for c in cars):
-        impute_fees(cars)
+        impute_fees(cars, typical_fee)
     for c in cars:
         c["delivery"] = round(delivery.cost(c["distance"]))
         c["cost"] = c["price"] + per_mile * c["miles"] + c["delivery"] + c["fee"]
