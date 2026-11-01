@@ -68,6 +68,25 @@ def record_run(con, zip_code, listings, errors, ts=None):
     return run_id
 
 
+def augment_run(con, run_id, listings, resolved=(), errors=()):
+    """Add listings to an existing run. Every source the augment attempted gets its verdict rewritten: one that
+    succeeded loses its error, one that failed gets this attempt's message rather than the original run's stale
+    one. Sources the augment did not touch keep theirs. An on-demand source belongs in the run it supplements,
+    so the report shows one merged set rather than the augment alone."""
+    with con:
+        if listings:
+            con.executemany(
+                f"INSERT OR REPLACE INTO listings(run_id, {', '.join(COLS)}) "
+                f"VALUES (?, {', '.join('?' * len(COLS))})",
+                [(run_id, *(l[c] for c in COLS)) for l in listings])
+        attempted = set(resolved) | {e[0] for e in errors}
+        kept = [e for e in json.loads(con.execute("SELECT errors FROM runs WHERE id=?", (run_id,)).fetchone()["errors"])
+                if e[0] not in attempted] + [list(e) for e in errors]
+        ok = con.execute("SELECT EXISTS (SELECT 1 FROM listings WHERE run_id=?)", (run_id,)).fetchone()[0]
+        con.execute("UPDATE runs SET errors=?, ok=? WHERE id=?", (json.dumps(kept), int(bool(ok)), run_id))
+    return run_id
+
+
 def merged(con, run_id, model="crown"):
     """One row per VIN for a run and vehicle profile: lowest price wins, every source's quote kept."""
     cars = {}

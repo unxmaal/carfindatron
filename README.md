@@ -15,7 +15,7 @@ Sources are Carfax, Toyota Certified and Lexus Certified inventory, and toyota.c
 
 - macOS. Scheduling and notifications use launchd and macOS notifications.
 - [uv](https://docs.astral.sh/uv/)
-- Google Chrome, for the toyota.com new-car source only. It runs in a window placed off screen for about ten seconds per scan.
+- Google Chrome, for the toyota.com new-car source and for Carfax. It runs in a window placed off screen for about ten seconds per scan.
 
 ## Install
 
@@ -50,9 +50,23 @@ Common variations:
 
 ```
 uv run carfindatron --profiles es300h            # one vehicle
-uv run carfindatron --sources carfax,toyota      # skip the browser-based toyota.com source
+uv run carfindatron --sources toyota             # skip the browser-based toyota.com source
 uv run carfindatron --report-only --open         # rebuild the pages from the last scan, no fetching
 ```
+
+## Adding Carfax
+
+Carfax blocks plain requests, so it is not part of a normal scan. It answers from inside a browser session, and this adds it to the scan you ran last:
+
+```
+uv run carfindatron --augment --sources carfax,carfax_new --open
+```
+
+A Chrome window opens off screen, loads carfax.com to establish a session, and fetches about 40 pages of listings over half a minute. The rows join the last run rather than starting a new one, so the report shows everything merged. The session is kept in its own Chrome profile under `~/.local/share/carfindatron/`, so later runs start already trusted.
+
+Carfax is where dealer fees, lot dates and Carfax's own value estimate come from, and it adds roughly a fifth of the new-car listings. It is not needed for certified cars, which Toyota and Lexus Certified cover on their own.
+
+If a challenge appears, the window comes to the front and waits for you to clear it, then carries on. Run it yourself rather than from a schedule: it needs a browser, and a site that blocks automated requests can escalate to blocking your address.
 
 ## Reading the report
 
@@ -109,7 +123,8 @@ Scheduled runs post a macOS notification when a car in the focus trims appears o
 |---|---|---|
 | `--zip`, `--save-zip` | from config | Search origin; `--save-zip` stores it |
 | `--profiles` | all | Vehicles to scan: `crown`, `es300h` |
-| `--sources` | all | `carfax`, `toyota`, `carfax_new`, `toyota_new` |
+| `--sources` | `toyota,toyota_new` | Add `carfax`, `carfax_new` with `--augment` |
+| `--augment` | off | Add the fetched sources to the last run instead of starting a new one |
 | `--free-radius` | 200 | Miles you would drive to collect a car |
 | `--ship-base`, `--ship-per-mile`, `--ship-min` | 350, 0.60, 500 | Shipping estimate beyond the radius |
 | `--inspection` | 200 | Pre-purchase inspection for a remote purchase |

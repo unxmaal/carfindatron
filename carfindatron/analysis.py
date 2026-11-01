@@ -99,7 +99,10 @@ def fit(cars):
     xs = [features(c, trims, years, has_new) for c in rows]
     xtx = [[sum(x[i] * x[j] for x in xs) for j in range(p)] for i in range(p)]
     xty = [sum(x[i] * c["price"] for x, c in zip(xs, rows)) for i in range(p)]
-    beta = solve(xtx, xty)
+    try:
+        beta = solve(xtx, xty)
+    except ValueError:
+        return None  # a constant column (new cars all read 0 miles): no model, rather than no report
     for x, c in zip(xs, rows):
         c["expected"] = round(sum(b * v for b, v in zip(beta, x)))
         c["resid"] = c["price"] - c["expected"]

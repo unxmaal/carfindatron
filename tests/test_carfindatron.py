@@ -1,3 +1,4 @@
+import contextlib
 import copy
 from datetime import date
 import json
@@ -60,9 +61,11 @@ def fake_get(url):
 def fake_sources(monkeypatch):
     for name in ("carfax", "toyota", "carfax_new"):
         fn = getattr(sources, name)
-        monkeypatch.setitem(sources.SOURCES, name, lambda *a, fn=fn, **kw: fn(*a, get=fake_get, **kw))
+        monkeypatch.setitem(sources.SOURCES, name, lambda *a, fn=fn, **kw: fn(*a, **{"get": fake_get, **kw}))
     monkeypatch.setitem(sources.SOURCES, "toyota_new", lambda *a, **kw: sources.toyota_new(
-        *a, get=fake_get, fetch=lambda z: copy.deepcopy(TCOM), **kw))
+        *a, fetch=lambda z: copy.deepcopy(TCOM), **{"get": fake_get, **kw}))
+    # No test may launch Chrome: the fixtures already stand in for what the browser would fetch.
+    monkeypatch.setattr(cli, "carfax_session", lambda: contextlib.nullcontext())
 
 
 REAL_CONFIG = cli.CONFIG
@@ -215,6 +218,282 @@ def test_source_failures_counts_only_a_current_unbroken_streak(con):
     assert store.source_failures(con, clean) == {}
 
 
+class FakeSession:
+    def __init__(self):
+        self.urls = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def get(self, url):
+        self.urls.append(url)
+        return fake_get(url)
+
+
+def browser(monkeypatch):
+    """Replace the Chrome seam with a recorder; returns the list of sessions opened."""
+    made = []
+
+    def factory():
+        made.append(FakeSession())
+        return made[-1]
+
+    monkeypatch.setattr(cli, "carfax_session", factory)
+    return made
+
+
+def test_one_browser_session_is_shared_by_every_carfax_fetch(tmp_path, monkeypatch):
+    fake_sources(monkeypatch)
+    made = browser(monkeypatch)
+    assert cli.main(["--db", str(tmp_path / "c.db"), "--html", str(tmp_path / "r.html"),
+                     "--sources", "carfax,toyota"]) == 0
+    assert len(made) == 1, "both profiles share one session rather than launching Chrome each time"
+    assert made[0].urls and all(u.startswith(sources.CARFAX_API) for u in made[0].urls)
+
+
+def test_no_browser_is_opened_when_carfax_is_not_asked_for(tmp_path, monkeypatch):
+    fake_sources(monkeypatch)
+    made = browser(monkeypatch)
+    assert cli.main(["--db", str(tmp_path / "c.db"), "--html", str(tmp_path / "r.html")]) == 0
+    assert made == [], "the scheduled run must never need a browser for Carfax"
+
+
+def test_augment_through_the_cli_joins_the_last_run_and_clears_its_error(tmp_path, monkeypatch, capsys):
+    fake_sources(monkeypatch)
+    db, page = tmp_path / "c.db", tmp_path / "r.html"
+    args = ["--db", str(db), "--html", str(page), "--profiles", "crown"]
+
+    def boom(*a, **kw):
+        raise OSError("blocked")
+
+    monkeypatch.setitem(sources.SOURCES, "carfax", boom)
+    assert cli.main(args + ["--sources", "carfax,toyota"]) == 0
+    con = sqlite3.connect(db)
+    con.row_factory = sqlite3.Row
+    assert json.loads(con.execute("SELECT errors FROM runs").fetchone()["errors"]) == [["crown:carfax", "OSError: blocked"]]
+    toyota_vins = con.execute("SELECT COUNT(DISTINCT vin) FROM listings").fetchone()[0]
+
+    fake_sources(monkeypatch)
+    made = browser(monkeypatch)
+    capsys.readouterr()
+    assert cli.main(args + ["--sources", "carfax", "--augment"]) == 0
+    assert len(made) == 1
+    assert con.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 1, "an augment is not a new run"
+    assert json.loads(con.execute("SELECT errors FROM runs").fetchone()["errors"]) == []
+    assert con.execute("SELECT COUNT(DISTINCT vin) FROM listings").fetchone()[0] > toyota_vins
+    assert {r[0] for r in con.execute("SELECT DISTINCT source FROM listings")} == {"carfax", "toyota"}
+    assert "WARNING" not in capsys.readouterr().out
+
+
+def test_a_block_partway_through_pagination_keeps_the_pages_already_fetched():
+    """A 403 on a later page must not throw away the pages already fetched."""
+    calls = {"n": 0}
+
+    def get(url):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return json.loads((FIX / "h1.json").read_text())
+        raise sources.Blocked("403")
+
+    with pytest.raises(sources.Blocked) as caught:
+        sources.carfax(ZIP, CROWN, get=get)
+    kept = caught.value.listings
+    assert kept and all(l["source"] == "carfax" for l in kept)
+    assert str(len(kept)) in str(caught.value), "the warning should say how much survived"
+
+
+def test_a_block_on_the_very_first_page_keeps_nothing_and_still_raises():
+    def get(url):
+        raise sources.Blocked("403")
+
+    with pytest.raises(sources.Blocked) as caught:
+        sources.carfax(ZIP, CROWN, get=get)
+    assert caught.value.listings == []
+
+
+def test_scan_banks_a_partially_blocked_source_and_still_warns(con, monkeypatch):
+    def partial(zip_code, prof, dealers=None, **kw):
+        raise sources.Blocked("403 after 1 listing", listings=listings(("a", 50000)))
+
+    monkeypatch.setitem(sources.SOURCES, "carfax", partial)
+    run, errors = cli.scan(con, ZIP, [CROWN], ["carfax"])
+    assert run is not None, "a partial haul is still worth a run"
+    assert [c["vin"] for c in store.merged(con, run)] == ["a"]
+    assert errors == [["crown:carfax", "Blocked: 403 after 1 listing"]]
+    assert store.source_failures(con, run) == {"crown:carfax": 1}
+
+
+def test_an_augment_that_partly_blocked_does_not_clear_the_error(con, monkeypatch):
+    run = store.record_run(con, ZIP, listings(("z", 50000)), [["crown:carfax", "old"]], ts="2026-01-01")
+
+    def partial(zip_code, prof, dealers=None, **kw):
+        raise sources.Blocked("403 again", listings=listings(("a", 50000)))
+
+    monkeypatch.setitem(sources.SOURCES, "carfax", partial)
+    cli.scan(con, ZIP, [CROWN], ["carfax"], into=run)
+    assert [e[0] for e in json.loads(con.execute("SELECT errors FROM runs WHERE id=?", (run,)).fetchone()["errors"])] \
+        == ["crown:carfax"], "a source that only half worked has not recovered"
+    assert {c["vin"] for c in store.merged(con, run)} == {"a", "z"}
+
+
+def test_an_augment_records_its_own_failure_rather_than_leaving_a_stale_one(con, monkeypatch):
+    """Otherwise the banner quotes the original run's error and the operator debugs the wrong transport."""
+    run = store.record_run(con, ZIP, listings(("z", 50000)),
+                           [["crown:carfax", "HTTPError: HTTP Error 403: Forbidden"],
+                            ["crown:toyota_new", "untouched"]], ts="2026-01-01")
+
+    def partial(zip_code, prof, dealers=None, **kw):
+        raise sources.Blocked("403 on page 3 of 21, kept 50 listings", listings=listings(("a", 50000)))
+
+    monkeypatch.setitem(sources.SOURCES, "carfax", partial)
+    cli.scan(con, ZIP, [CROWN], ["carfax"], into=run)
+    errs = json.loads(con.execute("SELECT errors FROM runs WHERE id=?", (run,)).fetchone()["errors"])
+    assert ["crown:toyota_new", "untouched"] in errs, "a source the augment did not touch keeps its error"
+    assert ["crown:carfax", "Blocked: 403 on page 3 of 21, kept 50 listings"] in errs
+    assert len(errs) == 2
+
+
+def test_carfax_sources_need_a_browser_and_are_out_of_the_daily_default():
+    assert sources.BROWSER_SOURCES == {"carfax", "carfax_new"}
+    assert set(cli.DAILY_SOURCES) == {"toyota", "toyota_new"}
+    assert not set(cli.DAILY_SOURCES) & sources.BROWSER_SOURCES, "a scheduled run must not need a browser session"
+    assert sources.BROWSER_SOURCES < set(sources.SOURCES), "they stay reachable with --sources"
+
+
+def test_scan_gives_the_browser_transport_only_to_the_sources_that_need_it(con, monkeypatch):
+    seen = {}
+
+    def record(name):
+        def fn(zip_code, prof, dealers=None, **kw):
+            seen[name] = kw.get("get")
+            return []
+        return fn
+
+    for name in sources.SOURCES:
+        monkeypatch.setitem(sources.SOURCES, name, record(name))
+    sentinel = object()
+    cli.scan(con, ZIP, [CROWN], ["carfax", "toyota"],
+             get_for=lambda n: sentinel if n in sources.BROWSER_SOURCES else None)
+    assert seen == {"carfax": sentinel, "toyota": None}
+
+
+def test_augmenting_adds_to_the_last_run_rather_than_starting_a_new_one(con):
+    """A Carfax-only run of its own would report 55 Crowns and compare against a baseline weeks old."""
+    toyota_rows = [dict(l, source="toyota") for l in listings(("a", 50000), ("b", 48000))]
+    run = store.record_run(con, ZIP, toyota_rows, [["crown:carfax", "HTTPError: 403"]], ts="2026-01-01")
+    extra = listings(("b", 47000), ("c", 46000))
+    same, errors = cli.scan(con, ZIP, [CROWN], [], into=run)
+    assert same == run
+    store.augment_run(con, run, extra, resolved=["crown:carfax"])
+    assert con.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 1
+    cars = {c["vin"]: c for c in store.merged(con, run)}
+    assert set(cars) == {"a", "b", "c"}, "the report must show the merged set, not just the augment"
+    assert cars["b"]["price"] == 47000 and cars["b"]["prices"] == {"toyota": 48000, "carfax": 47000}
+
+
+def test_augmenting_clears_the_error_of_a_source_that_has_now_succeeded(con):
+    run = store.record_run(con, ZIP, listings(("a", 50000)),
+                           [["crown:carfax", "HTTPError: 403"], ["crown:toyota_new", "boom"]], ts="2026-01-01")
+    store.augment_run(con, run, listings(("b", 48000)), resolved=["crown:carfax"])
+    row = con.execute("SELECT ok, errors FROM runs WHERE id=?", (run,)).fetchone()
+    assert row["ok"] == 1
+    assert json.loads(row["errors"]) == [["crown:toyota_new", "boom"]]
+    assert store.source_failures(con, run) == {"crown:toyota_new": 1}
+
+
+def test_augment_without_a_stored_run_is_an_error(tmp_path, capsys):
+    assert cli.main(["--augment", "--db", str(tmp_path / "c.db"), "--html", str(tmp_path / "r.html")]) == 1
+    assert "no runs stored yet" in capsys.readouterr().err
+
+
+def test_a_challenge_handler_refuses_to_block_an_unattended_run(monkeypatch):
+    monkeypatch.setattr(sources.sys.stdin, "isatty", lambda: False)
+    assert sources.challenge_prompt(None) is None
+    waited = []
+    monkeypatch.setattr(sources.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda *a: waited.append(True))
+    page = FakePage([])
+    assert sources.challenge_prompt(page) is page
+    assert waited == [True] and page.fronted == 1
+
+
+class FakePage:
+    """Stands in for a Playwright page: answers evaluate() with queued {status, body} replies."""
+
+    def __init__(self, replies):
+        self.replies = list(replies)
+        self.urls = []
+        self.fronted = 0
+
+    def evaluate(self, script, url):
+        self.urls.append(url)
+        return self.replies.pop(0)
+
+    def bring_to_front(self):
+        self.fronted += 1
+
+
+def test_page_get_reads_json_through_the_page(monkeypatch):
+    page = FakePage([{"status": 200, "body": '{"listings": [], "totalPageCount": 2}'}])
+    monkeypatch.setattr(sources.time, "sleep", lambda s: None)
+    assert sources.page_get(page, "https://helix.carfax.com/x")["totalPageCount"] == 2
+    assert page.urls == ["https://helix.carfax.com/x"]
+
+
+def test_a_block_message_does_not_carry_the_search_zip(monkeypatch):
+    """Blocked messages are stored in the run and rendered into a report served on the LAN."""
+    page = FakePage([{"status": 403, "body": "blocked"}])
+    monkeypatch.setattr(sources.time, "sleep", lambda s: None)
+    with pytest.raises(sources.Blocked) as caught:
+        sources.page_get(page, f"{sources.CARFAX_API}?zip=90210&radius=3000&page=1")
+    assert "90210" not in str(caught.value) and "?" not in str(caught.value)
+
+
+def test_page_get_hands_a_challenge_to_the_operator_then_retries(monkeypatch):
+    page = FakePage([{"status": 403, "body": "blocked"}, {"status": 200, "body": '{"ok": 1}'}])
+    monkeypatch.setattr(sources.time, "sleep", lambda s: None)
+    seen = []
+    assert sources.page_get(page, "u", on_challenge=seen.append) == {"ok": 1}
+    assert seen == [0] and len(page.urls) == 2
+
+
+def test_page_get_gives_up_when_a_challenge_never_clears(monkeypatch):
+    page = FakePage([{"status": 403, "body": "blocked"}] * 3)
+    monkeypatch.setattr(sources.time, "sleep", lambda s: None)
+    with pytest.raises(sources.Blocked):
+        sources.page_get(page, "u", on_challenge=lambda attempt: None, attempts=3)
+    assert len(page.urls) == 3
+
+
+def test_page_get_does_not_wait_on_a_challenge_with_no_handler(monkeypatch):
+    page = FakePage([{"status": 403, "body": "blocked"}])
+    monkeypatch.setattr(sources.time, "sleep", lambda s: None)
+    with pytest.raises(sources.Blocked):
+        sources.page_get(page, "u")
+    assert len(page.urls) == 1, "an unattended run must fail fast, not loop on a challenge"
+
+
+def test_page_get_paces_requests_so_a_scan_does_not_read_as_a_scrape(monkeypatch):
+    page = FakePage([{"status": 200, "body": "{}"}] * 3)
+    slept = []
+    monkeypatch.setattr(sources.time, "sleep", slept.append)
+    for _ in range(3):
+        sources.page_get(page, "u", pace_s=0.4)
+    assert slept == [0.4, 0.4, 0.4], "a hard IP block is worse than a slow scan"
+
+
+def test_carfax_parses_the_same_listings_through_a_page_as_through_urllib(carfax):
+    """The browser is only a transport: every parsing rule is reused unchanged."""
+    pages = [{"status": 200, "body": json.dumps(json.loads((FIX / f"h{p}.json").read_text()))} for p in (1, 2, 3)]
+    page = FakePage(pages)
+    through_page = sources.carfax(ZIP, CROWN, get=lambda u: sources.page_get(page, u, pace_s=0))
+    assert [l["vin"] for l in through_page] == [l["vin"] for l in carfax]
+    assert all(u.startswith(sources.CARFAX_API) for u in page.urls)
+
+
 def test_http_get_gives_up_on_4xx_but_retries_a_throttle(monkeypatch):
     tries = []
 
@@ -244,6 +523,19 @@ def test_digest_escalates_a_source_that_keeps_failing(con):
     assert payload["run"]["failures"] == {"crown:carfax": 3}
     assert "failed: crown:carfax (3 runs running)" in cli.digest(payload)
     assert "(3 runs running)" in cli.text(payload)
+
+
+def test_a_collinear_scan_loses_the_price_model_instead_of_crashing_the_report(con):
+    """New cars all carry 0 miles, so a run left with one trim and one year has a constant column. The report
+    must go without the model, as it already does when there are too few cars."""
+    rows = [dict(car(f"v{i}", 50000 + i * 25), miles=0, condition="new", year=2026) for i in range(14)]
+    assert analysis.fit(rows) is None
+    stored = [dict(sources.listing("toyota_new", f"v{i}", 2026, "Platinum", 50000 + i * 25, 0, 5, "d", "c", "GA",
+                                   "", condition="new"), trim="Platinum") for i in range(14)]
+    run = store.record_run(con, ZIP, stored, [], ts="2026-01-01")
+    payload = cli.build(con, run, per_mile=0.25)
+    assert payload["model"] is None and len(payload["cars"]) == 14
+    assert report.render(payload)
 
 
 def test_rank_orders_by_weighted_cost_and_marks_pareto():
@@ -295,7 +587,8 @@ def test_report_embeds_data_without_breaking_out_of_script():
 def test_cli_end_to_end_writes_db_and_page(tmp_path, monkeypatch, capsys):
     fake_sources(monkeypatch)
     db, page = tmp_path / "c.db", tmp_path / "r.html"
-    assert cli.main(["--db", str(db), "--html", str(page), "--profiles", "crown"]) == 0
+    assert cli.main(["--db", str(db), "--html", str(page), "--profiles", "crown",
+                     "--sources", "carfax,toyota,carfax_new,toyota_new"]) == 0
     out = capsys.readouterr().out
     assert re.search(r"Platinum: \d+ CPO, \d+ new", out) and "WARNING" not in out
     con = sqlite3.connect(db)
@@ -313,7 +606,8 @@ def test_cli_partial_failure_is_recorded_and_warned(tmp_path, monkeypatch, capsy
     fake_sources(monkeypatch)
     monkeypatch.setitem(sources.SOURCES, "toyota", boom)
     db = tmp_path / "c.db"
-    assert cli.main(["--db", str(db), "--html", str(tmp_path / "r.html"), "--profiles", "crown"]) == 0
+    assert cli.main(["--db", str(db), "--html", str(tmp_path / "r.html"), "--profiles", "crown",
+                     "--sources", "carfax,toyota"]) == 0
     assert "WARNING: crown:toyota failed: OSError: blocked" in capsys.readouterr().out
     assert sqlite3.connect(db).execute("SELECT ok FROM runs").fetchone()[0] == 1
 
