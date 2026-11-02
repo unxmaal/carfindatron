@@ -95,11 +95,12 @@ svg text{fill:var(--muted);font-size:11px}
  <label>Miles <input id="f-mmin" type="number" min="0" step="1000" placeholder="min"> to <input id="f-mmax" type="number" min="0" step="1000" placeholder="max"></label>
  <label>Max distance <input id="f-dist" type="number" min="0" step="100" placeholder="any"></label>
  <label><input id="f-acc" type="checkbox" checked> Hide accident/damage</label>
+ <label><input id="f-phantom" type="checkbox" checked> Hide probably sold</label>
  <details class="ex" id="ex"><summary id="ex-sum">Exclude…</summary><div class="panel" id="ex-panel"></div></details>
  <span class="muted" id="count"></span>
 </div>
 <div class="tablewrap wide"><table><thead><tr id="head"></tr></thead><tbody id="body"></tbody></table></div>
-<p class="note">Effective cost = price + $<span id="pm"></span>/odometer mile<span id="pms"></span> + dealer doc fee + cost to get it home. It is dollars, so lower is better. Within <span id="fr"></span> mi of ZIP <span id="zp"></span> getting it home is free (drive over). Farther away it is a remote purchase: open-carrier shipping at $<span id="sb"></span> + $<span id="spm"></span>/mi (minimum $<span id="smin"></span>) plus a $<span id="insp"></span> independent pre-purchase inspection. ★ = no other car of the same trim (new or CPO) is cheaper, lower-mileage and closer. “vs model” = asking price minus the price the regression expects for that trim, year, mileage and new vs CPO; negative is cheaper than the market. Days listed marked * have no dealer date and count from the first scan that saw the car. Doc fees marked * are not on the listing: the same dealer's fee from another listing, or the median. Leverage (hover for reasons) counts public signals that a dealer has room to move: time on the lot, price cuts, the same car listed at two prices, asking above Carfax's value or the market model, and a dealer holding many of this model; buyer interest and not-yet-arrived cars count against. It is a heuristic, not a prediction. Offer = a suggested opening price for the vehicle: the fair price is the median of the market model, Carfax's value and (new cars) MSRP less what the more flexible quarter of dealers advertise, never above asking; the offer goes 1% under fair per leverage point, up to 5%. Fees are itemized from the listing: optional items are left out of the cost and flagged to refuse, dealer service, prep and processing charges are counted but flagged to push back, and new-car protection packages and dealer-installed options are flagged to have removed. Hover Offer and Fees for the details.</p>
+<p class="note">Effective cost = price + $<span id="pm"></span>/odometer mile<span id="pms"></span> + dealer doc fee + cost to get it home. It is dollars, so lower is better. Within <span id="fr"></span> mi of ZIP <span id="zp"></span> getting it home is free (drive over). Farther away it is a remote purchase: open-carrier shipping at $<span id="sb"></span> + $<span id="spm"></span>/mi (minimum $<span id="smin"></span>) plus a $<span id="insp"></span> independent pre-purchase inspection. ★ = no other car of the same trim (new or CPO) is cheaper, lower-mileage and closer. “vs model” = asking price minus the price the regression expects for that trim, year, mileage and new vs CPO; negative is cheaper than the market. Days listed marked * have no dealer date and count from the first scan that saw the car. “Probably sold” marks a car the feed still carries with no photographs at all after a month or more on the lot, which is what an abandoned record looks like; those cars are hidden by default and left out of the figures above, and hovering the tag gives the reasons. Doc fees marked * are not on the listing: the same dealer's fee from another listing, or the median. Leverage (hover for reasons) counts public signals that a dealer has room to move: time on the lot, price cuts, the same car listed at two prices, asking above Carfax's value or the market model, and a dealer holding many of this model; buyer interest and not-yet-arrived cars count against. It is a heuristic, not a prediction. Offer = a suggested opening price for the vehicle: the fair price is the median of the market model, Carfax's value and (new cars) MSRP less what the more flexible quarter of dealers advertise, never above asking; the offer goes 1% under fair per leverage point, up to 5%. Fees are itemized from the listing: optional items are left out of the cost and flagged to refuse, dealer service, prep and processing charges are counted but flagged to push back, and new-car protection packages and dealer-installed options are flagged to have removed. Hover Offer and Fees for the details.</p>
 </main><div id="tip" hidden></div>
 <script>
 const D=/*DATA*/null;
@@ -119,14 +120,14 @@ $("trend-h").textContent=`${FL} asking price over time`;if(!PR.has_new){$("leg-n
 {const sel=$("f-trim"),opt=(v,t)=>{const o=document.createElement("option");o.value=v;o.textContent=t;sel.appendChild(o)};
  opt("__focus",FL);opt("","All trims");[...new Set(D.cars.map(c=>c.trim).filter(Boolean))].sort().forEach(t=>{if(!(FOCUS.length===1&&FOCUS[0]===t))opt(t,t)})}
 if(PR.miles){$("f-mmin").value=PR.miles[0];$("f-mmax").value=PR.miles[1]}
-const P=D.cars.filter(inFocus),cnt=(a,k)=>a.filter(c=>c.condition===k).length;
+const P=D.cars.filter(c=>inFocus(c)&&!c.phantom),cnt=(a,k)=>a.filter(c=>c.condition===k).length;
 $("sub").textContent=`Scan ${new Date(D.run.ts).toLocaleString()} from ZIP ${D.zip} · ${D.cars.length} listed (all trims) · ${FL}: ${cnt(P,"cpo")} certified pre-owned${PR.has_new?`, ${cnt(P,"new")} new`:""} · sources: ${PR.has_new?"Carfax, Toyota Certified, toyota.com":"Carfax, Lexus Certified (via Toyota's certified inventory)"}`;
 if(D.run.errors.length){const f=D.run.failures||{},w=$("warn");w.className="warn";
  w.textContent="Partial scan: "+D.run.errors.map(e=>e.join(": ")+(f[e[0]]?` (${f[e[0]]} runs running)`:"")).join("; ")}
 $("pm").textContent=D.weights.per_mile;$("pms").textContent=D.weights.per_mile_source==="market"?" (what the market charges per mile on certified cars of this model in this scan)":"";$("fr").textContent=fmt(D.weights.free_radius);$("zp").textContent=D.zip;
 $("sb").textContent=fmt(D.weights.ship_base);$("spm").textContent=D.weights.ship_per_mile.toFixed(2);$("smin").textContent=fmt(D.weights.ship_min);$("insp").textContent=fmt(D.weights.inspection);
 
-const plat=D.cars.filter(c=>inFocus(c)&&!c.accident),cpo=plat.filter(c=>c.condition==="cpo"),nw=plat.filter(c=>c.condition==="new");
+const plat=D.cars.filter(c=>inFocus(c)&&!c.accident&&!c.phantom),cpo=plat.filter(c=>c.condition==="cpo"),nw=plat.filter(c=>c.condition==="new");
 function kpi(label,value,detail){const d=document.createElement("div");d.className="card kpi";
  [["l",label],["v",value],["d",detail]].forEach(([c,t])=>{const s=document.createElement("div");s.className=c;s.textContent=t;d.appendChild(s)});$("kpis").appendChild(d)}
 const med=a=>{const s=a.map(c=>c.price).sort((x,y)=>x-y);return s.length?s[Math.floor(s.length/2)]:null}, by=(a,k)=>[...a].sort((x,y)=>x[k]-y[k])[0];
@@ -225,9 +226,9 @@ document.addEventListener("click",e=>{const d=$("ex");if(d.open&&!d.contains(e.t
 $("ex").addEventListener("toggle",()=>{if($("ex").open)buildExclude()});
 function draw(){
  const cond=$("f-cond").value,trim=$("f-trim").value,maxd=parseFloat($("f-dist").value),hideAcc=$("f-acc").checked,
-  mmin=parseFloat($("f-mmin").value),mmax=parseFloat($("f-mmax").value);
+  hidePh=$("f-phantom").checked,mmin=parseFloat($("f-mmin").value),mmax=parseFloat($("f-mmax").value);
  POOL=D.cars.filter(c=>(!cond||c.condition===cond)&&(trim==="__focus"?inFocus(c):(!trim||c.trim===trim))&&(isNaN(maxd)||c.distance<=maxd)
-  &&(isNaN(mmin)||c.miles>=mmin)&&(isNaN(mmax)||c.miles<=mmax)&&(!hideAcc||!c.accident));
+  &&(isNaN(mmin)||c.miles>=mmin)&&(isNaN(mmax)||c.miles<=mmax)&&(!hideAcc||!c.accident)&&(!hidePh||!c.phantom));
  const rows=POOL.filter(c=>!excluded(c));if(!$("ex").open)buildExclude();
  const get=COLS.find(c=>c[0]===sortKey)[2];
  rows.sort((a,b)=>{const x=get(a),y=get(b);if(x==null)return 1;if(y==null)return -1;return (x<y?-1:x>y?1:0)*sortDir});
@@ -257,6 +258,7 @@ function draw(){
   const car=stack(`${c.year} ${c.trim||"?"}`,[c.condition==="new"?"New":`CPO · ${c.prior_use||"use unknown"}`]);
   if(["Rental","Commercial"].includes(c.prior_use)){car.appendChild(tag(c.prior_use.toLowerCase(),"bad"))}
   if(c.prior_use==="Lease"){car.appendChild(tag("lease return","good"))}
+  if(c.phantom){car.appendChild(tag("probably sold","bad",(c.phantom_why||[]).join("; ")))}
   tr.appendChild(td(car));
   const r=td(c.resid==null?"":sgn(c.resid),"n");if(c.z!=null&&c.z<=-1.5){r.prepend(tag("deal","good"))}tr.appendChild(r);
   const lv=td(c.leverage>0?"+".repeat(Math.min(c.leverage,5)):c.leverage<0?"−":"·","n");lv.title=(c.leverage_why||[]).join("\n")||"No signals";
@@ -277,7 +279,7 @@ function draw(){
   tr.appendChild(td(dl,"wrap"));
   body.appendChild(tr)});
 }
-["f-cond","f-trim","f-dist","f-acc","f-mmin","f-mmax"].forEach(id=>$(id).addEventListener("input",draw));
+["f-cond","f-trim","f-dist","f-acc","f-phantom","f-mmin","f-mmax"].forEach(id=>$(id).addEventListener("input",draw));
 buildExclude();
 $("f-cond").addEventListener("input",stateChart);
 draw();stateChart();

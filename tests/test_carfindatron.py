@@ -1147,3 +1147,183 @@ def test_tcom_vehicles_reads_a_batch_and_tolerates_an_empty_answer():
     assert sources.tcom_vehicles({"data": {"locateVehiclesByZip": {"vehicleSummary": [{"vin": "a"}]}}}) == [{"vin": "a"}]
     assert sources.tcom_vehicles({"data": {"locateVehiclesByZip": None}}) == []
     assert sources.tcom_vehicles({"data": {}}) == [] and sources.tcom_vehicles({}) == []
+
+
+def feed_car(vin, photos=3, updated="2026-10-01T12:00:00.000Z", acquired="2026-10-01", price=45000, miles=3000):
+    return {"vin": vin, "year": 2026, "grade": "Platinum", "mileage": miles, "dealerCd": "99999",
+            "price": {"sellingPrice": price}, "owningDealerName": "Test Toyota", "acquiredDate": acquired,
+            "eta": {"lastUpdatedAt": updated},
+            "media": [{"href": f"p{i}.jpg", "type": "exterior", "visible": True} for i in range(photos)]}
+
+
+def feed_get(vehicles):
+    def get(url):
+        if "/rest/dealers?" in url:
+            return {}
+        return {"vehicleSummary": vehicles, "pagination": {"totalPages": 1}}
+    return get
+
+
+WACO = "JTDAFAAF5S3011802"
+
+
+def test_toyota_keeps_the_photo_count_and_the_feed_timestamp():
+    [c] = sources.toyota(ZIP, CROWN, get=feed_get([feed_car(WACO, photos=4, updated="2026-04-07T19:37:25.575Z")]),
+                         dealers={})
+    assert c["photos"] == 4 and c["feed_updated"] == "2026-04-07"
+
+
+def test_a_listing_with_no_media_at_all_reads_as_no_pictures():
+    v = feed_car(WACO, photos=0)
+    del v["media"]
+    [c] = sources.toyota(ZIP, CROWN, get=feed_get([v]), dealers={})
+    assert c["photos"] == 0
+
+
+def test_hidden_photos_do_not_count_as_pictures():
+    v = feed_car(WACO)
+    v["media"] = [{"href": "a.jpg", "visible": False}, {"href": "b.jpg", "visible": True}]
+    [c] = sources.toyota(ZIP, CROWN, get=feed_get([v]), dealers={})
+    assert c["photos"] == 1
+
+
+def test_the_store_keeps_the_photo_count_and_the_feed_date(con):
+    l = sources.listing("toyota", WACO, 2026, "Platinum", 45995, 3416, 1, "D", "C", "TX", "u",
+                        photos=0, feed_updated="2026-04-07T19:37:25.575Z")
+    [c] = store.merged(con, store.record_run(con, ZIP, [l], []))
+    assert c["photos"] == 0 and c["feed_updated"] == "2026-04-07"
+
+
+def test_a_source_that_reports_no_photo_count_does_not_erase_one(con):
+    a = sources.listing("carfax", WACO, 2026, "Platinum", 45000, 1, 1, "", "", "", "")
+    b = sources.listing("toyota", WACO, 2026, "Platinum", 46000, 1, 1, "", "", "", "", photos=12)
+    [c] = store.merged(con, store.record_run(con, ZIP, [a, b], []))
+    assert c["photos"] == 12
+
+
+def test_vin_observations_counts_scans_and_distinct_prices_and_mileages(con):
+    for ts, price, miles in (("2026-01-01", 45995, 3416), ("2026-01-02", 45995, 3416), ("2026-01-03", 44995, 3500)):
+        store.record_run(con, "z", [sources.listing("toyota", WACO, 2026, "Platinum", price, miles, 1,
+                                                    "D", "C", "TX", "u")], [], ts=ts)
+    assert store.vin_observations(con)[WACO] == {"scans": 3, "prices": 2, "mileages": 2}
+
+
+def phantom_car(**kw):
+    base = dict(photos=0, days=230, prices={"toyota": 45995})
+    return car("V1", 45995, **{**base, **kw})
+
+
+def test_a_car_with_no_pictures_after_months_on_the_lot_is_flagged_a_phantom():
+    cars = [phantom_car()]
+    analysis.phantom_signals(cars, {"V1": {"scans": 61, "prices": 1, "mileages": 1}})
+    assert cars[0]["phantom"]
+
+
+def test_a_new_arrival_without_pictures_yet_is_not_flagged_a_phantom():
+    """Measured: of three zero-photo certified Crowns, two were 3 and 11 days old and real. Zero photos only
+    means abandoned once enough time has passed for a dealer to have photographed the car."""
+    cars = [phantom_car(days=3)]
+    analysis.phantom_signals(cars, {"V1": {"scans": 1, "prices": 1, "mileages": 1}})
+    assert not cars[0]["phantom"]
+
+
+def test_a_long_listed_car_with_pictures_is_not_flagged_a_phantom():
+    cars = [phantom_car(photos=31)]
+    analysis.phantom_signals(cars, {"V1": {"scans": 61, "prices": 1, "mileages": 1}})
+    assert not cars[0]["phantom"]
+
+
+def test_a_source_that_reports_no_photo_count_is_never_flagged_a_phantom():
+    """New cars from toyota.com and Carfax rows carry no photo count, and unknown must not read as zero."""
+    cars = [phantom_car(photos=None)]
+    analysis.phantom_signals(cars, {"V1": {"scans": 61, "prices": 1, "mileages": 1}})
+    assert not cars[0]["phantom"]
+
+
+def test_a_car_of_unknown_age_is_not_flagged_a_phantom():
+    cars = [phantom_car(days=None)]
+    analysis.phantom_signals(cars, {"V1": {"scans": 61, "prices": 1, "mileages": 1}})
+    assert not cars[0]["phantom"]
+
+
+def test_the_reasons_record_what_corroborates_a_phantom_listing():
+    cars = [phantom_car()]
+    analysis.phantom_signals(cars, {"V1": {"scans": 61, "prices": 1, "mileages": 1}})
+    why = " | ".join(cars[0]["phantom_why"])
+    assert "no pictures" in why and "230 days" in why and "61 scans" in why and "one source" in why
+
+
+def test_corroborating_signals_alone_never_flag_a_car_a_phantom():
+    """Frozen price, frozen mileage and a single source together describe 17 of 80 stored CPO Crowns, so they
+    corroborate a verdict and must never produce one."""
+    cars = [phantom_car(photos=31)]
+    analysis.phantom_signals(cars, {"V1": {"scans": 61, "prices": 1, "mileages": 1}})
+    assert not cars[0]["phantom"] and cars[0]["phantom_why"] == []
+
+
+def phantom_run(con, ts="2026-11-01", photos=0, since="2026-03-16"):
+    l = sources.listing("toyota", WACO, 2026, "Platinum", 45995, 3416, 1, "Toyota of Waco", "Waco", "TX", "u",
+                        listed_since=since, photos=photos, feed_updated="2026-04-07")
+    real = sources.listing("toyota", "JTDAFAAF5S3099999", 2026, "Platinum", 52000, 9000, 1, "Real Toyota",
+                           "Austin", "TX", "u", listed_since="2026-10-20", photos=30, feed_updated="2026-10-21")
+    return store.record_run(con, "z", [l, real], [], ts=ts)
+
+
+def test_a_phantom_car_is_kept_out_of_the_ranking_and_listed_separately(con):
+    payload = cli.build(con, phantom_run(con), per_mile=0.25)
+    out = cli.text(payload)
+    ranked, _, tail = out.partition("Probably sold")
+    assert "Toyota of Waco" not in ranked and "Toyota of Waco" in tail
+    assert "Real Toyota" in ranked
+
+
+def test_a_phantom_car_is_never_announced_as_a_new_car(con):
+    """The phantom would otherwise be the cheapest NEW car every first scan and notify about a sold car."""
+    payload = cli.build(con, phantom_run(con), per_mile=0.25)
+    assert "Toyota of Waco" not in (cli.digest(payload) or "")
+    assert all(not c["phantom"] for c in cli.focus_cars(payload))
+
+
+def test_the_days_before_a_car_counts_as_a_phantom_is_configurable(con):
+    run = phantom_run(con)
+    def flags(days):
+        return [c["phantom"] for c in cli.build(con, run, per_mile=0.25, phantom_days=days)["cars"] if c["vin"] == WACO]
+    assert flags(30) == [True] and flags(365) == [False]
+
+
+def test_the_report_carries_the_phantom_flag_and_a_filter_for_it(con):
+    payload = cli.build(con, phantom_run(con), per_mile=0.25)
+    page = report.render(payload)
+    assert '"phantom":true' in page and "no pictures after 230 days on the lot" in page
+    assert 'id="f-phantom" type="checkbox" checked' in page          # the control, hiding them by default
+    assert "!hidePh||!c.phantom" in page                             # the control actually filters the table
+    assert '"probably sold"' in page                                 # the row is tagged when it is shown
+    assert "!c.accident&&!c.phantom" in page                         # and left out of the headline figures
+
+
+def test_dealer_url_skips_email_addresses_and_social_links():
+    """Measured on the live dealer locator: the shortest URI is often an email or a Twitter page, and one
+    dealer's was a salesperson's personal gmail address, which the report served as its inventory link."""
+    def org(*urls):
+        return {"primaryContact": [{"uricommunication": [{"uriid": {"value": u}} for u in urls]}]}
+    assert sources.dealer_url(org("https://www.d.com", "https://twitter.com/d", "text@d.com",
+                                  "https://www.facebook.com/d", "Textisbest@textme.com",
+                                  "https://autoparts.d.com/")) == "https://www.d.com"
+    assert sources.dealer_url(org("sales@d.com", "https://www.yelp.com/biz/d",
+                                  "http://local.yahoo.com/info-1-d")) is None
+    assert sources.dealer_url(org("https://www.d.com", "https://www.d.com/certified-inventory/")) \
+        == "https://www.d.com/certified-inventory/"
+
+
+def test_the_fixture_recorder_keeps_the_fields_the_phantom_check_needs():
+    """The fixtures are trimmed to the fields the code reads, so a field the code starts reading has to be
+    added here or the next re-record silently drops it."""
+    import scripts.record_fixtures as rec
+    assert "eta" in rec.TOYOTA_KEEP and "media" in rec.TOYOTA_KEEP
+
+
+def test_the_newest_feed_date_wins_when_two_sources_carry_a_car(con):
+    a = sources.listing("carfax", WACO, 2026, "Platinum", 45000, 1, 1, "", "", "", "", feed_updated="2026-04-07")
+    b = sources.listing("toyota", WACO, 2026, "Platinum", 46000, 1, 1, "", "", "", "", feed_updated="2026-10-21")
+    [c] = store.merged(con, store.record_run(con, ZIP, [a, b], []))
+    assert c["feed_updated"] == "2026-10-21"

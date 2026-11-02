@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS listings (
     condition TEXT NOT NULL DEFAULT 'cpo', listed_since TEXT, msrp INTEGER, note TEXT,
     doc_fee INTEGER, value INTEGER, followers INTEGER,
     ext_color TEXT, ext_family TEXT, two_tone INTEGER, int_color TEXT, fees_json TEXT, msrp_only INTEGER, prior_use TEXT, url_exact INTEGER, dealer_url TEXT,
+    photos INTEGER, feed_updated TEXT,
     PRIMARY KEY (run_id, source, vin)
 );
 CREATE TABLE IF NOT EXISTS dealers (
@@ -32,10 +33,12 @@ CREATE INDEX IF NOT EXISTS listings_vin ON listings(vin);
 """
 COLS = ("source", "model", "vin", "year", "trim", "price", "miles", "distance", "dealer", "city", "state",
         "url", "one_owner", "accident", "condition", "listed_since", "msrp", "note", "doc_fee", "value", "followers",
-        "ext_color", "ext_family", "two_tone", "int_color", "fees_json", "msrp_only", "prior_use", "url_exact", "dealer_url")
+        "ext_color", "ext_family", "two_tone", "int_color", "fees_json", "msrp_only", "prior_use", "url_exact", "dealer_url",
+        "photos", "feed_updated")
 MIGRATIONS = {"model": "TEXT NOT NULL DEFAULT 'crown'", "condition": "TEXT NOT NULL DEFAULT 'cpo'", "listed_since": "TEXT", "msrp": "INTEGER",
               "note": "TEXT", "doc_fee": "INTEGER", "value": "INTEGER", "followers": "INTEGER",
-              "ext_color": "TEXT", "ext_family": "TEXT", "two_tone": "INTEGER", "int_color": "TEXT", "fees_json": "TEXT", "msrp_only": "INTEGER", "prior_use": "TEXT", "url_exact": "INTEGER", "dealer_url": "TEXT"}
+              "ext_color": "TEXT", "ext_family": "TEXT", "two_tone": "INTEGER", "int_color": "TEXT", "fees_json": "TEXT", "msrp_only": "INTEGER", "prior_use": "TEXT", "url_exact": "INTEGER", "dealer_url": "TEXT",
+              "photos": "INTEGER", "feed_updated": "TEXT"}
 DEALER_TTL_DAYS = 30
 USE_RANK = {u: i for i, u in enumerate(("Rental", "Commercial", "Fleet/corporate", "Multiple", "Lease", "Personal", "New"))}
 
@@ -106,9 +109,11 @@ def merged(con, run_id, model="crown"):
         c["msrp_only"] = bool(c["msrp_only"]) and (r["price"] > c["price"] or bool(r["msrp_only"]))
         c["msrp"] = c["msrp"] or r["msrp"]
         c["note"] = c["note"] or r["note"]
-        for k in ("doc_fee", "value", "followers", "int_color", "fees_json", "dealer_url"):
+        for k in ("doc_fee", "value", "followers", "int_color", "fees_json", "dealer_url", "photos"):
             if c[k] is None:
                 c[k] = r[k]
+        if r["feed_updated"] and (not c["feed_updated"] or r["feed_updated"] > c["feed_updated"]):
+            c["feed_updated"] = r["feed_updated"]
         if r["ext_color"] and len(r["ext_color"]) > len(c["ext_color"] or ""):
             c.update(ext_color=r["ext_color"], ext_family=r["ext_family"], two_tone=bool(r["two_tone"]))
         if r["listed_since"] and (not c["listed_since"] or r["listed_since"] < c["listed_since"]):
@@ -142,6 +147,15 @@ def price_history(con):
                             WHERE r.ok=1 GROUP BY l.run_id, l.vin ORDER BY r.id"""):
         hist.setdefault(r["vin"], []).append([r["ts"], r["p"]])
     return hist
+
+
+def vin_observations(con, model="crown"):
+    """vin -> how many runs saw it and how many distinct prices and mileages it has ever shown. A car whose
+    price and odometer never move across months of scans is not being touched by anyone."""
+    return {r["vin"]: {"scans": r["scans"], "prices": r["prices"], "mileages": r["mileages"]}
+            for r in con.execute("""SELECT vin, COUNT(DISTINCT run_id) scans, COUNT(DISTINCT price) prices,
+                                           COUNT(DISTINCT miles) mileages
+                                    FROM listings WHERE model=? GROUP BY vin""", (model,))}
 
 
 def source_failures(con, run_id, limit=60):

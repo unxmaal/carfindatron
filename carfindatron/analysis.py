@@ -164,6 +164,31 @@ def leverage(cars, sigma=None):
     return cars
 
 
+PHANTOM_MIN_DAYS = 30
+PHANTOM_MIN_SCANS = 10
+
+
+def phantom_signals(cars, obs, min_days=PHANTOM_MIN_DAYS):
+    """Flag listings that look like records nobody maintains any more. The verdict rests on one thing: no
+    photographs on a car that has been listed long enough to have been photographed. Measured against the
+    certified feed that picks 1 car in 102. The frozen price, frozen odometer and single-source facts describe
+    a fifth of the inventory by themselves, so they corroborate the verdict and never produce it."""
+    for c in cars:
+        days, photos = c.get("days"), c.get("photos")
+        c["phantom"] = photos == 0 and days is not None and days >= min_days
+        why = []
+        if c["phantom"]:
+            why.append(f"no pictures after {days} days on the lot")
+            o = obs.get(c["vin"]) or {}
+            if (o.get("scans") or 0) >= PHANTOM_MIN_SCANS and o.get("prices") == 1 and o.get("mileages") == 1:
+                why.append(f"price and odometer unchanged across {o['scans']} scans")
+            quotes = c.get("prices") or {}
+            if len(quotes) == 1:
+                why.append(f"carried by one source only ({next(iter(quotes))})")
+        c["phantom_why"] = why
+    return cars
+
+
 HIGH_DOC_FEE = 1000
 
 
