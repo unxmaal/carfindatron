@@ -172,7 +172,8 @@ def prior_use(labels):
 def listing(source, vin, year, trim, price, miles, distance, dealer, city, state, url,
             one_owner=False, accident=False, condition="cpo", listed_since=None, msrp=None, note=None,
             doc_fee=None, value=None, followers=None, ext=(None, None, False), int_color=None, fees=None,
-            msrp_only=False, use=None, profile=CROWN, url_exact=None, dealer_url=None):
+            msrp_only=False, use=None, profile=CROWN, url_exact=None, dealer_url=None,
+            photos=None, feed_updated=None):
     return dict(source=source, model=profile.key, vin=vin, year=int(year), trim=norm_trim(trim, vin, profile), price=int(price),
                 miles=int(miles or 0), distance=int(distance), dealer=dealer, city=city, state=state,
                 url=url, one_owner=bool(one_owner), accident=bool(accident), condition=condition,
@@ -184,7 +185,8 @@ def listing(source, vin, year, trim, price, miles, distance, dealer, city, state
                 fees_json=json.dumps(fees) if fees else None, msrp_only=bool(msrp_only),
                 prior_use="New" if condition == "new" else use,
                 url_exact=bool(url_exact if url_exact is not None else "carfax.com/vehicle/" in (url or "")),
-                dealer_url=dealer_url or None)
+                dealer_url=dealer_url or None,
+                photos=None if photos is None else int(photos), feed_updated=iso_date(feed_updated))
 
 
 FEE_RULES = (
@@ -309,10 +311,18 @@ def toyota_dealers(zip_code, wanted, get=http_get, cache=None, max_pages=40, bra
     return found
 
 
+NOT_A_DEALER_SITE = re.compile(
+    r"facebook\.com|twitter\.com|//(www\.)?x\.com|youtube\.com|plus\.google\.com|google\.com/|yahoo\.com"
+    r"|yelp\.com|bing\.com|instagram\.com|linkedin\.com|tiktok\.com|pinterest\.com|cars\.com|cargurus\.com", re.I)
+
+
 def dealer_url(org):
-    """The dealer's certified/used inventory page from the locator's web links, else its home page."""
+    """The dealer's certified/used inventory page from the locator's web links, else its home page. The locator
+    mixes email addresses, social profiles and review listings into the same field."""
     urls = [u.get("uriid", {}).get("value") for c in org.get("primaryContact") or []
             for u in c.get("uricommunication") or [] if u.get("uriid", {}).get("value")]
+    urls = [u for u in urls if u.lower().startswith(("http://", "https://"))
+            and "@" not in u and not NOT_A_DEALER_SITE.search(u)]
     for pattern in (r"certified", r"pre-?owned|used"):
         hit = next((u for u in urls if re.search(pattern, u, re.I)), None)
         if hit:
@@ -356,7 +366,9 @@ def toyota(zip_code, profile=CROWN, get=http_get, dealers=None):
             int_color=interior((v.get("intColor") or {}).get("marketingName"),
                                ((v.get("intColor") or {}).get("commonName") or {}).get("generic")),
             use=prior_use([(cfx.get("useType") or {}).get("iconText"), "rental" if v.get("isPreviousRental") else None]),
-            profile=profile, url_exact=exact, dealer_url=site))
+            profile=profile, url_exact=exact, dealer_url=site,
+            photos=sum(1 for m in v.get("media") or [] if m.get("visible", True)),
+            feed_updated=(v.get("eta") or {}).get("lastUpdatedAt")))
     return out
 
 

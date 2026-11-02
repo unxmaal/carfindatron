@@ -82,7 +82,7 @@ The table has one row per car. Click a column header to sort; click it again to 
 | Miles, Distance | Odometer miles, and miles from your ZIP with the cost of getting the car home. |
 | Fees | Dealer fees you would likely pay. A red "to fight" tag means an optional package, a questionable charge or a high doc fee; hover for the itemized list. A `*` means the fee was not on the listing and is estimated. |
 | Days listed | Days since the dealer acquired or first listed the car. A `*` means no dealer date was available and the count starts from the first scan that saw the car. |
-| Car | Year, trim, new or CPO, and prior use (personal, lease, fleet, rental, commercial). Rental and commercial cars are tagged in red, lease returns in green. |
+| Car | Year, trim, new or CPO, and prior use (personal, lease, fleet, rental, commercial). Rental and commercial cars are tagged in red, lease returns in green. A red "probably sold" tag marks a listing with no photographs at all after a month or more on the lot, which is what a record nobody maintains looks like; hover for the reasons. |
 | vs model | Asking price minus what the market model expects for that trim, year and mileage. Negative is cheaper than the market. A "deal" tag marks cars well under. |
 | Leverage | Signs that the dealer has room to move on price. Hover for the reasons. |
 | History | Price over past scans, with the change since the last scan. |
@@ -91,9 +91,17 @@ The table has one row per car. Click a column header to sort; click it again to 
 
 ### Filters
 
-Above the table: condition (new or CPO), trim, mileage range, maximum distance, and whether to hide cars with an accident or damage report. **Exclude…** opens checkboxes for prior use, exterior color, roof and interior. Exclusions are remembered in your browser.
+Above the table: condition (new or CPO), trim, mileage range, maximum distance, whether to hide cars with an accident or damage report, and whether to hide cars that look sold. **Exclude…** opens checkboxes for prior use, exterior color, roof and interior. Exclusions are remembered in your browser.
 
 The ES 300h page opens filtered to Luxury and Ultra Luxury between 10,000 and 25,000 miles.
+
+## Listings that are not really for sale
+
+Toyota's national certified inventory does not retire a record when a dealer stops maintaining it, so cars that have been sold can sit in the feed for months. One had been the cheapest car in this report for six weeks: sold in April, and cheap only because its price stopped tracking the market when the dealer moved on. Effective cost is what the report sorts by, so a listing like that goes straight to the top and stays there.
+
+The dealer's photographs are what gives it away. A certified Crown carries about 30 photos; a car with none has either just arrived or been abandoned, and how long it has been on the lot tells you which. So a listing with no photographs at all after `--phantom-days` on the lot is treated as sold: left out of the ranking and the headline figures, hidden behind a filter in the report, and listed separately at the end of the terminal summary with the reasons, so nothing disappears without saying so.
+
+Dates and prices are no help here. A dealer record's own "last updated" timestamp follows the acquisition date within a day, and four fifths of cars never change their asking price or odometer reading between scans, so neither says anything about whether a car is still for sale.
 
 ## How far away is too far
 
@@ -130,6 +138,7 @@ Scheduled runs post a macOS notification when a car in the focus trims appears o
 | `--inspection` | 200 | Pre-purchase inspection for a remote purchase |
 | `--per-mile` | market rate | Charge per odometer mile |
 | `--typical-fee` | 448 | Doc fee assumed when no listing in the scan carries one |
+| `--phantom-days` | 30 | Days on the lot after which a listing with no photographs is treated as sold |
 | `--db`, `--html` | `~/.local/share/carfindatron/` | Database and landing page locations |
 | `--report-only` | off | Rebuild pages from the last scan |
 | `--open` | off | Open the report when done |

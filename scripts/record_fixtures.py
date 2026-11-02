@@ -17,7 +17,7 @@ CARFAX_KEEP = ("vin", "year", "trim", "subTrim", "listPrice", "currentPrice", "m
                "vdpUrl", "oneOwner", "noAccidents", "firstSeen", "fees", "onePrice", "followCount", "exteriorColor",
                "interiorColor", "vehicleUseHistory")
 TOYOTA_KEEP = ("vin", "year", "grade", "price", "mileage", "dealerCd", "owningDealerName", "acquiredDate",
-               "isPreviousRental", "extColor", "intColor")
+               "isPreviousRental", "extColor", "intColor", "eta", "media")
 TCOM_KEEP = ("vin", "year", "grade", "dealerCd", "dealerMarketingName", "dealerWebsite", "distance", "isPreSold",
              "inventoryStatus", "inventoryMileage", "price")
 

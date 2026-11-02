@@ -64,7 +64,7 @@ def scan(con, zip_code, profiles, names, get_for=None, into=None):
 
 
 def build(con, run_id, profile=CROWN, per_mile=None, delivery=analysis.Delivery(),
-          typical_fee=analysis.TYPICAL_DOC_FEE):
+          typical_fee=analysis.TYPICAL_DOC_FEE, phantom_days=analysis.PHANTOM_MIN_DAYS):
     run = dict(con.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone())
     cars = store.merged(con, run_id, profile.key)
     gone = store.status(con, run_id, cars, profile.key)
@@ -87,6 +87,7 @@ def build(con, run_id, profile=CROWN, per_mile=None, delivery=analysis.Delivery(
         since = sources.iso_date(c.get("listed_since"))
         c["listed_since"] = since
         c["days"] = (today - date.fromisoformat(since)).days if since else None
+    analysis.phantom_signals(cars, store.vin_observations(con, profile.key), phantom_days)
     analysis.leverage(cars, model and model["sigma"])
     analysis.fee_flags(cars)
     analysis.targets(cars, analysis.new_discount(cars, profile.focus))
@@ -103,8 +104,11 @@ def build(con, run_id, profile=CROWN, per_mile=None, delivery=analysis.Delivery(
 
 
 def focus_cars(payload, clean=False):
+    """The focus-trim cars worth ranking. Listings that look sold are left out: one had been the cheapest car
+    in the report for six weeks, and it was cheap because its price stopped tracking the market in April."""
     focus = payload["profile"]["focus"]
-    return [c for c in payload["cars"] if c["trim"] in focus and not (clean and c.get("accident"))]
+    return [c for c in payload["cars"] if c["trim"] in focus and not c.get("phantom")
+            and not (clean and c.get("accident"))]
 
 
 def text(payload, top=25):
@@ -124,6 +128,12 @@ def text(payload, top=25):
     n_new = sum(c["condition"] == "new" for c in plat)
     lines.append(f"\n{' / '.join(payload['profile']['focus'])}: {len(plat) - n_new} CPO, {n_new} new. "
                  f"{len(payload['cars'])} stored this run.")
+    ghosts = sorted((c for c in payload["cars"] if c.get("phantom") and c["trim"] in payload["profile"]["focus"]),
+                    key=lambda c: c["cost"])
+    if ghosts:
+        lines.append(f"\nProbably sold, left out of the ranking ({len(ghosts)}):")
+        lines += [f"  {c['price']:>8,} {c['dealer']} / {c['city']}, {c['state']}: {'; '.join(c['phantom_why'])}"
+                  for c in ghosts]
     fails = payload["run"].get("failures") or {}
     lines += [f"WARNING: {n} failed: {e}" + (f" ({fails[n]} runs running)" if n in fails else "")
               for n, e in payload["run"]["errors"]]
@@ -170,6 +180,8 @@ def main(argv=None):
     p.add_argument("--inspection", type=float, default=d.inspection, help="$ pre-purchase inspection for a remote buy")
     p.add_argument("--typical-fee", type=int, default=analysis.TYPICAL_DOC_FEE,
                    help="$ doc fee assumed when no listing in the scan carries one at all")
+    p.add_argument("--phantom-days", type=int, default=analysis.PHANTOM_MIN_DAYS,
+                   help="days on the lot after which a listing with no photographs is treated as sold")
     p.add_argument("--sources", default=",".join(DAILY_SOURCES),
                    help=f"default {','.join(DAILY_SOURCES)}; {','.join(sorted(sources.BROWSER_SOURCES))} need a "
                         "browser session, so pass them with --augment. toyota_new drives an off-screen Chrome window")
@@ -214,7 +226,7 @@ def main(argv=None):
     a.html.parent.mkdir(parents=True, exist_ok=True)
     messages = []
     for i, prof in enumerate(profiles):
-        payload = build(con, run_id, prof, a.per_mile, delivery, a.typical_fee)
+        payload = build(con, run_id, prof, a.per_mile, delivery, a.typical_fee, a.phantom_days)
         page = report.render(payload)
         (a.html.parent / f"report-{prof.key}.html").write_text(page)
         if i == 0:
